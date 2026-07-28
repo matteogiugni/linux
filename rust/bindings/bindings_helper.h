@@ -155,4 +155,5 @@ const vm_flags_t RUST_CONST_HELPER_VM_NOHUGEPAGE = VM_NOHUGEPAGE;
 #if IS_ENABLED(CONFIG_VIRTIO)
 #include <linux/virtio_config.h>
 #include <uapi/linux/virtio_ids.h>
+#include <linux/hw_random.h>
 #endif /* IS_ENABLED(CONFIG_VIRTIO) */
