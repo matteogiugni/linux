@@ -207,6 +207,44 @@ impl Virtqueue {
         Some((NonNull::new(ptr.cast())?, len))
     }
 
+    /// Add a single writable buffer to the virtqueue using a raw scatterlist.
+    ///
+    /// This is the low-level equivalent of `sg_init_one` + `virtqueue_add_inbuf`
+    /// used by the C virtio_rng driver.
+    ///
+    /// # Safety
+    ///
+    /// - `buf` must remain valid and not be accessed until the buffer is
+    ///   returned by [`Virtqueue::get_buf`].
+    /// - `token` must remain valid for the same duration.
+    pub unsafe fn add_inbuf(
+        &self,
+        buf: *mut u8,
+        len: usize,
+        token: *mut core::ffi::c_void,
+        gfp: kernel::alloc::Flags,
+    ) -> Result {
+        let sg = Opaque::<bindings::scatterlist>::uninit();
+        // SAFETY: `sg` is valid for write, `buf` and `len` are valid per caller.
+        unsafe {
+            bindings::sg_init_one(
+                sg.get(),
+                buf as *const core::ffi::c_void,
+                len as u32,
+            )
+        };
+        // SAFETY: vq, sg, token are all valid per caller and type invariants.
+        to_result(unsafe {
+            bindings::virtqueue_add_inbuf(
+                self.as_raw(),
+                sg.get(),
+                1,
+                token,
+                gfp.as_raw(),
+            )
+        })
+    }
+
     /// Add a list of scatter-gather lists to virtqueue.
     #[inline]
     #[doc(alias = "virtqueue_add_sgs")]

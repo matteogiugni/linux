@@ -64,6 +64,24 @@ impl DeviceId {
         ret.vendor = vendor;
         Self(ret)
     }
+
+    /// Returns a reference to the underlying `bindings::virtio_device_id` type.
+    #[inline]
+    pub const fn as_raw(&self) -> &bindings::virtio_device_id {
+        &self.0
+    }
+
+    /// Consumes `Self` and returns the underlying `bindings::virtio_device_id` type.
+    #[inline]
+    pub const fn into_raw(self) -> bindings::virtio_device_id {
+        self.0
+    }
+}
+
+impl From<bindings::virtio_device_id> for DeviceId {
+    fn from(id: bindings::virtio_device_id) -> Self {
+        Self(id)
+    }
 }
 
 /// Create a virtio `IdTable` with its alias for modpost.
@@ -128,6 +146,9 @@ pub trait Driver: Send {
     fn remove(dev: &Device<crate::device::Core>, this: Pin<&Self>) {
         _ = (dev, this);
     }
+
+    /// Called after probe to register the device with subsystems (Optional)
+    fn scan(_dev: &Device<crate::device::Bound>, _this: Pin<&Self>) {}
 }
 
 /// Abstraction for the virtio device structure (`struct virtio_device`).
@@ -140,9 +161,18 @@ pub struct Device<Ctx: crate::device::DeviceContext = crate::device::Normal>(
 );
 
 impl<Ctx: crate::device::DeviceContext> Device<Ctx> {
+    /// Returns a reference to the underlying `bindings::virtio_device` type.
     #[inline]
     fn as_raw(&self) -> *mut bindings::virtio_device {
         self.0.get()
+    }
+
+    /// Consumes `Self` and returns the underlying `bindings::virtio_device_id` type.
+    #[inline]
+    fn raw_device(&self) -> *mut bindings::device {
+        // SAFETY: By the type invariant of `Self`, `self.as_raw()` is a pointer to a valid
+        // `struct virtio_device`. 
+        unsafe { core::ptr::addr_of_mut!((*self.as_raw()).dev) }
     }
 }
 
@@ -157,6 +187,13 @@ unsafe impl<Ctx: crate::device::DeviceContext> crate::device::AsBusDevice<Ctx> f
 kernel::impl_device_context_deref!(unsafe { Device });
 
 impl<Ctx: crate::device::DeviceContext> Device<Ctx> {
+    /// Returns the `DeviceId` associated with this VirtIO device.
+    #[inline]
+    pub fn id(&self) -> DeviceId {
+        // SAFETY: 
+        unsafe { (*self.as_raw()).id.into() }
+    }
+
     // TODO: return VirtioID
     /// Returns the virtio device ID.
     #[inline]
@@ -185,7 +222,7 @@ impl<Ctx: crate::device::DeviceContext> Device<Ctx> {
     /// Mark device as ready.
     #[doc(alias = "virtio_device_ready")]
     #[inline]
-    pub fn ready(&self) {
+    pub fn device_ready(&self) {
         // SAFETY: By its type invariant `self.as_raw` is always a valid pointer to a
         // `struct virtio_device`.
         unsafe { bindings::virtio_device_ready(self.as_raw()) }
@@ -240,14 +277,13 @@ impl<Ctx: crate::device::DeviceContext> Device<Ctx> {
 impl<Ctx: crate::device::DeviceContext> AsRef<crate::device::Device<Ctx>> for Device<Ctx> {
     #[inline]
     fn as_ref(&self) -> &crate::device::Device<Ctx> {
-        // SAFETY: By the type invariant of `Self`, `self.as_raw()` is a pointer to a valid
-        // `struct virtio_device`.
-        let dev = unsafe { core::ptr::addr_of_mut!((*self.as_raw()).dev) };
-
         // SAFETY: `dev` points to a valid `struct device`.
-        unsafe { crate::device::Device::from_raw(dev) }
+       unsafe { crate::device::Device::from_raw(self.raw_device()) }
     }
 }
+
+// SAFETY: `virtio::Device<Core>` provides access to a valid DMA-capable device.
+impl crate::dma::Device for Device<crate::device::Core> {}
 
 /// An adapter for the registration of virtio drivers.
 pub struct Adapter<T: Driver>(T);
@@ -277,6 +313,7 @@ unsafe impl<T: Driver + 'static> crate::driver::RegistrationOps for Adapter<T> {
             (*vdrv.get()).id_table = T::ID_TABLE.as_ptr();
             (*vdrv.get()).probe = Some(Self::probe_callback);
             (*vdrv.get()).remove = Some(Self::remove_callback);
+            (*vdrv.get()).scan = Some(Self::scan_callback);
         }
 
         // SAFETY: `vdrv` is guaranteed to be a valid `DriverType`.
@@ -302,7 +339,7 @@ impl<T: Driver + 'static> Adapter<T> {
             dev.as_ref().set_drvdata(data)?;
             // SAFETY: `Device::set_drvdata()` was just called so it's safe to borrow the data.
             let data = unsafe { dev.as_ref().drvdata_borrow::<T>() };
-            dev.ready();
+            dev.device_ready();
             if let Err(err) = T::init(&data, dev) {
                 // SAFETY: `Device::set_drvdata()` was just called so it's safe to re-obtain the
                 // data.
@@ -329,6 +366,16 @@ impl<T: Driver + 'static> Adapter<T> {
 
         T::remove(dev, data);
         dev.reset();
+    }
+
+    extern "C" fn scan_callback(vdev: *mut bindings::virtio_device) {
+        // SAFETY:
+        let dev = unsafe { &*vdev.cast::<Device<crate::device::CoreInternal>>() };
+
+        // SAFETY:
+        let data = unsafe { dev.as_ref().drvdata_borrow::<T>() };
+
+        T::scan(dev, data);
     }
 }
 
