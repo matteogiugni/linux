@@ -104,6 +104,15 @@ impl Completion {
         unsafe { bindings::complete_all(self.as_raw()) };
     }
 
+    /// Signal a single task waiting on this completion.
+    ///
+    /// This method wakes up one task waiting on this completion. If no task is currently
+    /// waiting, the completion is recorded so that a future waiter will not block.
+    pub fn complete(&self) {
+        // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
+        unsafe { bindings::complete(self.as_raw()) };
+    }
+
     /// Wait for completion of a task.
     ///
     /// This method waits for the completion of a task; it is not interruptible and there is no
@@ -148,5 +157,12 @@ impl Completion {
             Ok(ret) => Ok(ret),
             Err(_) => Err(Error::from_errno(ret as c_int)),
         }
+    }
+
+    /// Reinitialize a completion to the uncompleted state.
+    ///
+    /// See also [`Completion::reinit`].
+    pub fn reinit(&self) {
+        unsafe { bindings::reinit_completion(self.as_raw()) };
     }
 }
