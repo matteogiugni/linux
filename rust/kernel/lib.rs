@@ -101,6 +101,7 @@ pub mod faux;
 pub mod firmware;
 pub mod fmt;
 pub mod fs;
+pub mod hwrng;
 #[cfg(CONFIG_I2C = "y")]
 pub mod i2c;
 pub mod id_pool;
