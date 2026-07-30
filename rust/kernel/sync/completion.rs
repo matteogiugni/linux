@@ -159,9 +159,24 @@ impl Completion {
         }
     }
 
-    /// Reinitialize a completion to the uncompleted state.
+    /// Wait for completion of a killable task without a timeout.
     ///
-    /// See also [`Completion::reinit`].
+    /// Like [`Completion::wait_for_completion_interruptible`], but only
+    /// interrupted by fatal signals (e.g. `SIGKILL`), not by all signals.
+    ///
+    /// See also [`Completion::complete_all`].
+    #[inline]
+    pub fn wait_for_completion_killable(&self) -> Result {
+        // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
+        let err = unsafe { bindings::wait_for_completion_killable(self.as_raw()) };
+        if err < 0 {
+            Err(Error::from_errno(err))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Reinitialize a completion to the uncompleted state.
     pub fn reinit(&self) {
         unsafe { bindings::reinit_completion(self.as_raw()) };
     }
