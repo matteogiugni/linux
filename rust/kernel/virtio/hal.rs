@@ -7,27 +7,48 @@
 
 pub type DmaAddress = u64;
 //TODO cpu and dma address, virtaddr and physaddr, or vaddr and paddr?
+//TODO impl Drop for DmaRegion to automatically free the memory when out of scope?
 pub struct DmaRegion {
     pub cpu_addr: core::ptr::NonNull<u8>,
     pub dma_addr: DmaAddress,
     pub size: usize,
 }
 
-/// Hardware abstraction layer for virtqueue OS-specific operations.
-///
-/// Implement this trait to port the virtqueue logic to a new OS or
-/// environment.
-///
+pub struct MemoryRegion<A: Allocator> {
+    cpu_addr: NonNull<u8>,
+    size: usize,
+    align: usize,
+    // This field is used to determine which allocator should handle the drop of this MemoryRegion.
+    _allocator: PhantomData<A>,
+}
+
 /// # Safety
 ///
 /// Implementors must guarantee that:
-/// - `dma_alloc` returns memory accessible by both CPU and device.
+/// - `dma_alloc` returns memory accessible by both CPU and device, DMA coherent.
 /// - `dma_free` only frees memory previously returned by `dma_alloc`.
-/// - `write_barrier` ensures all preceding writes are visible to the device.
-/// - `read_barrier` ensures all preceding device writes are visible to the CPU.
-pub unsafe trait Hal {
-
+pub unsafe trait Allocator {
     type Error;
+
+    /// Allocates `size` bytes aligned to `align`.
+    fn alloc(
+        size: usize,
+        align: usize,
+    ) -> Result<MemoryRegion<Self>, Self::Error>
+    where
+        Self: Sized;
+
+    /// Releases an allocation previously returned by `Self::alloc`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr`, `size`, and `align` must describe a live allocation
+    /// returned by this allocator.
+    unsafe fn dealloc(
+        ptr: NonNull<u8>,
+        size: usize,
+        align: usize,
+    );
 
     /// Allocate a DMA-capable memory region of `size` bytes.
     ///
@@ -51,12 +72,70 @@ pub unsafe trait Hal {
         &self,
         region: DmaRegion,
     );
+}
 
-    //TODO to decide wheter or not desc_state/extra 
-    //     should be allocated by the virtqueue logic
-    //     otherwise remove these
-    fn alloc<T>(&self, count: usize) -> Result<NonNull<T>, Self::Error>;
-    unsafe fn dealloc<T>(&self, ptr: NonNull<T>, count: usize);
+impl<A: Allocator> MemoryRegion<A> {
+    /// # Safety
+    ///
+    /// `cpu_addr`, `size`, and `align` must describe an allocation
+    /// obtained from `A`.
+    pub unsafe fn new(
+        cpu_addr: NonNull<u8>,
+        size: usize,
+        align: usize,
+    ) -> Self {
+        Self {
+            cpu_addr,
+            size,
+            align,
+            _allocator: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn cpu_addr(&self) -> NonNull<u8> {
+        self.cpu_addr
+    }
+
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    #[inline]
+    pub fn align(&self) -> usize {
+        self.align
+    }
+}
+
+impl<A: Allocator> Drop for MemoryRegion<A> {
+    fn drop(&mut self) {
+        // SAFETY:
+        // `MemoryRegion<A>` is constructed only from an allocation
+        // returned by `A`, uniquely owns that allocation, and stores
+        // the original size and alignment.
+        unsafe {
+            A::dealloc(
+                self.cpu_addr,
+                self.size,
+                self.align,
+            );
+        }
+    }
+}
+
+/// Hardware abstraction layer for virtqueue OS-specific operations.
+///
+/// Implement this trait to port the virtqueue logic to a new OS or
+/// environment.
+///
+/// # Safety
+///
+/// - `write_barrier` ensures all preceding writes are visible to the device.
+/// - `read_barrier` ensures all preceding device writes are visible to the CPU.
+pub unsafe trait Hal: Allocator {
+
+    type Error;
     
     //TODO linux implements weak barriers with VIRTIO_F_ORDER_PLATFORM feature
     //     add extra param to barrier functions to implement this feature if needed
