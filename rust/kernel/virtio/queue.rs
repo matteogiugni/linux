@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
 
 use core::{
-    mem::size_of,
+    mem::{size_of, align_of},
     ptr::NonNull,
-    sync::atomic::{AtomicU16, fence, Ordering},
 };
 
 use super::hal::{
     DmaAddress,
     DmaRegion,
+    MemoryRegion,
     Hal,
 };
 
@@ -33,16 +33,15 @@ pub const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
 
 //TODO refactor the code and divide into files
 //TODO packed virtqueue
-//TODO rollback on failed operation in every function
 //TODO HAL as PhantomData or as instance? after HAL complete definition
 //TODO if the VirtQueueFeatures will get a lot of fields, we may save this struct directly as a field
 //TODO VIRTIO_F_IN_ORDER feature?
 //TODO VIRTIO_F_RING_RESET feature?
 //TODO VIRTIO_F_ORDER_PLATFORM feature for weak barriers?
-//TODO add a generic alloc function in HAL for desc_state and desc_extra for better handling of clean up ops?
-//TODO DMA mapping inside or outside the virtqueue core logic?
-pub struct VirtQueue<'a, H: Hal> {
-
+//TODO when packed vqs are implemented, abstract the split vq struct from here
+//CHECK rollback on failed operation in every function
+pub struct VirtQueue<H: Hal> {
+    //CHECK is the option needed?
     ring_memory: Option<DmaRegion>,
 
     desc: NonNull<Descriptor>,
@@ -59,8 +58,8 @@ pub struct VirtQueue<'a, H: Hal> {
     num_free: u16,
     num_added: u16,
 
-    desc_state: &'a mut [DescState],
-    desc_extra: &'a mut [DescExtra],
+    desc_state_memory: MemoryRegion<H>,
+    desc_extra_memory: MemoryRegion<H>,
 
     avail_idx: u16,
     //TODO possible future need
@@ -70,29 +69,57 @@ pub struct VirtQueue<'a, H: Hal> {
     event_idx: bool,
     indirect: bool,
 
+    broken: bool,
+
     hal: H,
 }
 
-impl<'a, H: Hal> VirtQueue<'a, H> {
+impl<H: Hal> VirtQueue<H> {
 
     pub fn new(
         hal: H,
         queue_idx: u16,
         size: u16,
-        desc_state: &'a mut [DescState],
-        desc_extra: &'a mut [DescExtra],
         features: VirtQueueFeatures,
     ) -> Result<Self, Error<H::Error>> {
-        if desc_state.len() != usize::from(size)
-            || desc_extra.len() != usize::from(size)
-        {
-            return Err(Error::Queue(
-                VirtQueueError::InvalidParam,
-            ));
-        }
-
         let (desc_size, avail_size, used_size) = queue_part_sizes(size)?;
 
+        let n = usize::from(size);
+
+        // SAFETY:
+        // - `queue_part_sizes` guarantees `size <= 32768`.
+        // - The maximum allocation size for the current `DescState` and
+        //   `DescExtra` layouts is therefore representable in `usize`.
+        let desc_state_size = size_of::<DescState>() * n;
+        let desc_extra_size = size_of::<DescExtra>() * n;
+
+        // SAFETY:
+        // These memory allocations are dropped by the MemoryRegion Drop impl,
+        // which calls the appropriate deallocation function.
+        let desc_state_memory = H::alloc(
+                desc_state_size,
+                align_of::<DescState>(),
+            )
+            .map_err(Error::Hal)?;
+        
+        let desc_extra_memory = H::alloc(
+                desc_extra_size,
+                align_of::<DescExtra>(),
+            )
+            .map_err(Error::Hal)?;
+        
+        if desc_extra_memory.size < desc_extra_size ||
+            desc_state_memory.size < desc_state_size {
+            return Err(Error::Queue(
+                    VirtQueueError::MemoryAllocationFailed,
+                ));
+        }
+
+        // SAFETY:
+        // - desc_size, avail_size, and used_size are computed from the queue size, 
+        //   which is guaranteed to be <= 32768 and multiplied by small constants, 
+        //   so they are all representable in u32.
+        // - The sum of u32 values is representable in usize.
         let desc_offset = 0;
 
         let avail_offset =
@@ -103,15 +130,18 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 
         let total_size = used_offset + used_size;
 
-        let ring_memory = hal
-            .dma_alloc(total_size, DESC_ALIGN)
+        let ring_memory = hal.dma_alloc(
+                total_size,
+                DESC_ALIGN,
+            )
             .map_err(Error::Hal)?;
 
         // TODO if this fails, try to divide the 3 rings into 3 different memory spaces?
         //      or directly allocate them separetely?
+        //      Slower but more likely to succeed
         if ring_memory.size < total_size {
             // SAFETY:
-            // The region was allocated by this HAL and has not yet been
+            // The region was allocated by this function and has not yet been
             // exposed to the device.
             unsafe {
                 hal.dma_free(ring_memory);
@@ -123,13 +153,47 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         }
 
         // TODO to decide whether the HAL should zero out all
-        //      allocated memory or if the virtqueue logic should
+        //      allocated memory or if the virtqueue logic should.
+        //      The alloc() implementation may already zero out the memory by default
+        //      so maybe it's better to let it handle it.
+
+        let desc_state_ptr =
+            desc_state_memory
+                .cpu_addr()
+                .cast::<DescState>();
+
+        let desc_extra_ptr =
+            desc_extra_memory
+                .cpu_addr()
+                .cast::<DescExtra>();
+
+        // SAFETY:
+        // - `desc_state_memory` contains space for exactly `n` `DescState`s.
+        // - its address satisfies `align_of::<DescState>()`.
+        // - every element is currently uninitialized and exclusively owned here.
+        //
+        // The same holds for `desc_extra_memory`.
         unsafe {
-            core::ptr::write_bytes(
-                ring_memory.cpu_addr.as_ptr(),
-                0,
-                total_size,
-            );
+            for i in 0..n {
+                desc_state_ptr
+                    .as_ptr()
+                    .add(i)
+                    .write(DescState::empty());
+
+                // SAFETY:
+                // - `n = self.size`.
+                // - `self.size` is a `u16` and a power of 2.
+                let next = if i + 1 < n {
+                    (i + 1) as u16
+                } else {
+                    0
+                };
+
+                desc_extra_ptr
+                    .as_ptr()
+                    .add(i)
+                    .write(DescExtra { next });
+            }
         }
 
         let base = ring_memory.cpu_addr;
@@ -166,7 +230,7 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             UsedRing::new(used_ptr, size)
         };
 
-        let mut queue = Self {
+        let queue = Self {
             ring_memory: Some(ring_memory),
             desc,
             avail,
@@ -176,8 +240,8 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             num_free: size,
             num_added: 0,
             free_head: 0,
-            desc_state,
-            desc_extra,
+            desc_state_memory,
+            desc_extra_memory,
             avail_idx: 0,
             avail_flags: 0,
             last_used_idx: 0,
@@ -186,9 +250,8 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             avail_offset,
             used_offset,
             hal,
+            broken: false,
         };
-
-        queue.init_free_list();
 
         Ok(queue)
     }
@@ -207,7 +270,7 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             let index = self.free_head;
 
             let next_free =
-                self.desc_extra[usize::from(index)].next;
+                self.desc_extras()[usize::from(index)].next;
 
             let mut flags = DescFlags::empty();
 
@@ -223,13 +286,16 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
                 flags.insert(DescFlags::WRITE);
             }
 
-            self.write_desc(
-                index,
-                segment.dma_addr,
-                segment.len,
-                flags,
-                next,
-            );
+            // SAFETY: The index is checked and the descriptor has not yet been published to the device.
+            unsafe {
+                self.write_desc(
+                    index,
+                    segment.dma_addr,
+                    segment.len,
+                    flags,
+                    next,
+                );
+            }
 
             self.free_head = next_free;
         }
@@ -246,7 +312,8 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         &mut self,
         segments: &[DmaSegment],
     ) -> Result<u16, Error<H::Error>> {
-        //CHECK linux does not check this
+        //CHECK linux does not check this 
+        //      but the VIRTIO spec says that the indirect descriptors must not exceed the queue size
         if segments.len() > usize::from(self.size) {
             return Err(Error::Queue(VirtQueueError::InvalidParam));
         }
@@ -268,7 +335,7 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 
         if memory.size < indirect_size {
             // SAFETY:
-            // The region was allocated by this HAL and has not yet been
+            // The region was allocated by this function and has not yet been
             // exposed to the device.
             unsafe {
                 self.hal.dma_free(memory);
@@ -288,7 +355,6 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             // SAFETY:
             // - `segments.len() <= self.size`.
             // - `self.size` is a `u16` and a power of 2.
-            // - `self.size` <= 2^15 hence `self.size` + 1 < 2^16.
             let next : u16 = if i + 1 < segments.len() {
                 flags.insert(DescFlags::NEXT);
 
@@ -308,6 +374,10 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
                 next: next.to_le(),
             };
 
+            // SAFETY:
+            // indirect_desc points to a valid and correctly aligned memory region 
+            // of at least `indirect_size` bytes, 
+            // which is large enough to hold `segments.len()` descriptors.
             unsafe {
                 core::ptr::write_volatile(
                     indirect_desc.add(i),
@@ -317,22 +387,27 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         }
 
         let head = self.free_head;
-        let next_free = self.desc_extra[usize::from(head)].next;
+        let next_free = self.desc_extras()[usize::from(head)].next;
 
-        self.write_desc(
-            head,
-            memory.dma_addr,
-            // SAFETY:
-            // - `indirect_size <= u16 * 16`.
-            indirect_size as u32,
-            DescFlags::INDIRECT,
-            0,
-        );
+        // SAFETY: The index is checked and the descriptor has not yet been published to the device.
+        unsafe {
+            self.write_desc(
+                head,
+                memory.dma_addr,
+                // SAFETY:
+                // - Descriptor size is 16 bytes.
+                // - `indirect_size <= u16::MAX * 16`.
+                indirect_size as u32,
+                DescFlags::INDIRECT,
+                0,
+            );
+        }
 
-        self.free_head = next_free;
+        // SAFETY: `self.num_free > 0` for the above check.
         self.num_free -= 1;
+        self.free_head = next_free;
 
-        self.desc_state[usize::from(head)].indirect = Some(memory);
+        self.desc_states_mut()[usize::from(head)].indirect = Some(memory);
 
         Ok(head)
     }
@@ -360,17 +435,16 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         }
 
         //CHECK descriptor chain > queuesize per type of chain or together?
-        //      if it's the sum, refactor validate_segments
-        //TODO add a check to avoid overflow  
-        if indirect_segments.len() + direct_segments.len() 
-            > usize::from(self.size) - 1 {
+        //      if it's the sum, refactor validate_segments.
+        //      VIRTIO spec is not clear about this check
+        if indirect_segments.len() > usize::from(self.size) {
             return Err(Error::Queue(
                 VirtQueueError::InvalidParam,
             ));
         }
 
         // SAFETY:
-        // - `indirect_segments.len() <= self.size`. ***CHECK***
+        // - `indirect_segments.len() <= self.size`. ***CHECK above***
         // - `self.size` is a `u16`.
         // - `size_of::<Descriptor>()` is 16 bytes.
         let indirect_size = indirect_segments.len() * size_of::<Descriptor>();
@@ -381,6 +455,9 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             .map_err(Error::Hal)?;
 
         if indirect_memory.size < indirect_size {
+            // SAFETY:
+            // The region was allocated by this function and has not yet been
+            // exposed to the device.
             unsafe {
                 self.hal.dma_free(indirect_memory);
             }
@@ -401,9 +478,8 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             let mut flags = DescFlags::empty();
 
             // SAFETY:
-            // - `indirect_segments.len() <= self.size`.
+            // - `indirect_segments.len() <= self.size`. ***CHECK above***
             // - `self.size` is a `u16` and a power of 2.
-            // - `self.size` <= 2^15 hence `self.size` + 1 < 2^16.
             let next = if i + 1 < indirect_segments.len() {
                 flags.insert(DescFlags::NEXT);
 
@@ -413,8 +489,7 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             };
 
             if segment.direction
-                == BufferDirection::DeviceToDriver
-            {
+                == BufferDirection::DeviceToDriver {
                 flags.insert(DescFlags::WRITE);
             }
 
@@ -425,6 +500,11 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
                 next: next.to_le(),
             };
 
+            
+            // SAFETY:
+            // indirect_desc points to a valid and correctly aligned memory region 
+            // of at least `indirect_size` bytes, 
+            // which is large enough to hold `indirect_segments.len()` descriptors.
             unsafe {
                 core::ptr::write_volatile(
                     indirect_desc.add(i),
@@ -438,47 +518,54 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 
         for segment in direct_segments {
             let next =
-                self.desc_extra[usize::from(current)].next;
+                self.desc_extras()[usize::from(current)].next;
 
             let mut flags = DescFlags::NEXT;
 
             if segment.direction
-                == BufferDirection::DeviceToDriver
-            {
+                == BufferDirection::DeviceToDriver {
                 flags.insert(DescFlags::WRITE);
             }
 
-            self.write_desc(
-                current,
-                segment.dma_addr,
-                segment.len,
-                flags,
-                next,
-            );
+            // SAFETY: The index is checked and the descriptor has not yet been published to the device.
+            unsafe {
+                self.write_desc(
+                    current,
+                    segment.dma_addr,
+                    segment.len,
+                    flags,
+                    next,
+                );
+            }
 
             current = next;
         }
 
         let next_free =
-            self.desc_extra[usize::from(current)].next;
+            self.desc_extras()[usize::from(current)].next;
 
-        self.write_desc(
-            current,
-            indirect_memory.dma_addr,
-            // SAFETY:
-            // - `indirect_size <= u16 * 16`.
-            indirect_size as u32,
-            DescFlags::INDIRECT,
-            0,
-        );
+        // SAFETY: The index is checked and the descriptor has not yet been published to the device.
+        unsafe {
+            self.write_desc(
+                current,
+                indirect_memory.dma_addr,
+                // SAFETY:
+                // - `self.size` is a `u16`.
+                // - Descriptor size is 16 bytes.
+                // - `indirect_size <= u16::MAX * 16`.
+                indirect_size as u32,
+                DescFlags::INDIRECT,
+                0,
+            );
+        }
 
         self.free_head = next_free;
 
         // SAFETY:
-        // - Cannot overflow for the above checks.
+        // - Cannot underflow for the above checks.
         self.num_free -= (direct_segments.len() + 1) as u16;
 
-        self.desc_state[usize::from(head)].indirect =
+        self.desc_states_mut()[usize::from(head)].indirect =
             Some(indirect_memory);
 
         Ok(head)
@@ -486,7 +573,6 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 
     /// Builds the descriptor chain and then
     /// adds it to the available ring.
-    ///
     /// Returns the head descriptor index of the chain.
     ///
     /// # Safety
@@ -499,6 +585,10 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         token: Token,
         layout: DescriptorLayout,
     ) -> Result<(), Error<H::Error>> {
+        if self.broken {
+            return Err(Error::Queue(VirtQueueError::BrokenVirtQueue));
+        }
+
         Self::validate_segments(segments)?;
 
         let head = match layout {
@@ -522,6 +612,7 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
                 }
             }
             //CHECK linux does not permit this
+            //      but the VIRTIO spec says this is allowed
             DescriptorLayout::DirectThenIndirect { indirect_from } => {
                 if !self.indirect {
                     return Err(Error::Queue(
@@ -545,7 +636,7 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             }
         };
 
-        self.desc_state[usize::from(head)].token = Some(token);
+        self.desc_states_mut()[usize::from(head)].token = Some(token);
 
         let avail_slot = self.avail_idx & (self.size - 1);
 
@@ -563,10 +654,10 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 
     /// Adds a single input buffer (device-writable) to the virtqueue.
     ///
-    /// `addr` is the DMA address of the buffer.
-    /// `len` is the buffer size in bytes.
-    /// `token` is an opaque driver-provided value returned by [`Queue::get_buf`]
-    ///  when the buffer is used.
+    /// - `addr` is the DMA address of the buffer.
+    /// - `len` is the buffer size in bytes.
+    /// - `token` is an opaque driver-provided value returned by [`VirtQueue::get_buf`]
+    ///    when the buffer is used.
     ///
     /// # Safety
     ///
@@ -591,10 +682,10 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 
     /// Adds a single output buffer to the virtqueue.
     ///
-    /// `addr` is the DMA address of the buffer.
-    /// `len` is the buffer size in bytes.
-    /// `token` is an opaque driver-provided value returned by [`Queue::get_buf`]
-    ///  when the buffer is used.
+    /// - `addr` is the DMA address of the buffer.
+    /// - `len` is the buffer size in bytes.
+    /// - `token` is an opaque driver-provided value returned by [`VirtQueue::get_buf`]
+    ///    when the buffer is used.
     ///
     /// # Safety
     ///
@@ -625,6 +716,10 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
     pub fn get_buf(
         &mut self,
     ) -> Result<Option<(Token, u32)>, VirtQueueError> {
+        if self.broken {
+            return Err(VirtQueueError::BrokenVirtQueue);
+        }
+
         if !self.can_pop() {
             return Ok(None);
         }
@@ -632,20 +727,31 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         self.hal.read_barrier();
 
         let slot = self.last_used_idx & (self.size - 1);
-        let elem = self.used.read_elem(slot)?;
+        let elem = match self.used.read_elem(slot) {
+            Ok(elem) => elem,
+            Err(err) => {
+                self.mark_broken();
+                return Err(err);
+            }
+        };
 
-        //TODO skip the corrupted entry otherwise it comes back? manage it in someway
         if elem.id >= u32::from(self.size) {
+            self.mark_broken();
             return Err(VirtQueueError::CorruptedUsedElem);
         }
 
         let head = elem.id as u16;
         
-        let Ok(token) = self.desc_state[usize::from(head)]
-            .token
-            .ok_or(VirtQueueError::CorruptedDescriptor)?;
+        let token = match self.desc_states()[usize::from(head)].token {
+            Some(token) => token,
+            None => {
+                self.mark_broken();
+                return Err(VirtQueueError::CorruptedDescriptor);
+            }
+        };
 
-        self.recycle_chain(head)?;
+        // SAFETY: The device has finished with this request, so it can no longer access the descriptor chain.
+        unsafe { self.recycle_chain(head)? };
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
@@ -653,15 +759,15 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
     }
 
     /// Recycles a descriptor chain back to the free list.
-    fn recycle_chain(
+    /// 
+    /// # Safety
+    ///
+    /// The caller must guarantee that the device can no longer access or consume descriptors from this descriptor chain.
+    /// The caller must guarantee that the head index is valid and that the descriptor has a token associated with it.
+    unsafe fn recycle_chain(
         &mut self,
         head: u16,
     ) -> Result<(), VirtQueueError> {
-
-        //CHECK head >= self.size already tested outside the function, but we can move it here
-
-        //CHECK token is none already tested outside the function, but we can move it here
-
         let mut current = head;
         let mut count = 0u16;
 
@@ -672,12 +778,13 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         */
         loop {
 
-            count = count + 1;
-
             //CHECK a properly constructed chain cannot fail this check
-            if count > self.size {
+            if count == self.size {
+                self.mark_broken();
                 return Err(VirtQueueError::CorruptedDescriptor);
             }
+
+            count += 1;
 
             let descriptor = unsafe {
                 core::ptr::read_volatile(
@@ -691,7 +798,7 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
                 break;
             }
 
-            let next = self.desc_extra[usize::from(current)].next;
+            let next = self.desc_extras()[usize::from(current)].next;
 
             //CHECK a properly constructed chain cannot fail this check
             if next >= self.size {
@@ -701,17 +808,20 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             current = next;
         }
 
-        self.desc_extra[usize::from(current)].next = self.free_head;
+        //CHECK a properly constructed chain cannot fail this check
+        if count > self.size - self.num_free {
+            self.mark_broken();
+            return Err(VirtQueueError::CorruptedDescriptor);
+        }
+
+        self.desc_extras_mut()[usize::from(current)].next = self.free_head;
         self.free_head = head;
+        self.num_free += count;
 
-        //CHECK a properly constructed chain cannot overflow or surpass self.size, 
-        //      but we can add a check anyway
-        self.num_free = self.num_free + count;
-
-        self.desc_state[usize::from(head)].token = None;
+        self.desc_states_mut()[usize::from(head)].token = None;
 
         if let Some(indirect) =
-            self.desc_state[usize::from(head)].indirect.take()
+            self.desc_states_mut()[usize::from(head)].indirect.take()
         {
             // SAFETY:
             // The used-ring entry tells us that the device has finished with
@@ -724,25 +834,10 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         Ok(())
     }
 
-    /// Returns whether the virtqueue has any used buffers that can be popped.
-    pub fn peek_used(&self) -> Result<bool, VirtQueueError> {
-        if !self.can_pop() {
-            return Ok(false);
-        }
-
-        self.hal.read_barrier();
-
-        let slot = self.last_used_idx & (self.size - 1);
-        let elem = self.used.read_elem(slot)?;
-
-        if elem.id >= u32::from(self.size) {
-            return Err(VirtQueueError::CorruptedDescriptor);
-        }
-
-        Ok(true)
-    }
-
-    fn write_desc(
+    /// # Safety
+    ///
+    /// The caller must guarantee that the index is valid and that the descriptor has not yet been published to the device.
+    unsafe fn write_desc(
         &mut self,
         index: u16,
         addr: DmaAddress,
@@ -750,9 +845,6 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         flags: DescFlags,
         next: u16,
     ) {
-        //CHECK index < self.size already tested outside the function, but we can move it here
-        //      or directly assume the index is valid
-
         let descriptor = Descriptor {
             addr: addr.to_le(),
             len: len.to_le(),
@@ -776,17 +868,14 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 
     fn init_free_list(&mut self) {
         for i in 0..self.size {
-            self.desc_state[usize::from(i)] = DescState {
-                token: None,
-                indirect: None,
-            };
+            self.desc_states_mut()[usize::from(i)] = DescState::empty();
 
-            self.desc_extra[usize::from(i)] = DescExtra {
+            self.desc_extras_mut()[usize::from(i)] = DescExtra {
                 next: i + 1,
             };
         }
 
-        self.desc_extra[usize::from(self.size - 1)].next = 0;
+        self.desc_extras_mut()[usize::from(self.size - 1)].next = 0;
 
         self.free_head = 0;
         self.num_free = self.size;
@@ -794,32 +883,33 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 
     /// Returns `true` if the device should be notified.
     pub fn kick_prepare(&mut self) -> bool {
-        if self.num_added == 0 {
+        if self.broken || self.num_added == 0 {
             return false;
         }
+        
+        self.hal.mb();
 
-        //CHECK is num_added necessary?
         let new = self.avail_idx;
         let old = new.wrapping_sub(self.num_added);
 
-        self.hal.mb();
-
         let needs_kick = if self.event_idx {
-            need_event(self.used.avail_event(), new, old)
+            Self::need_event(self.used.avail_event(), new, old)
         } else {
             (self.used.flags() & VIRTQ_USED_F_NO_NOTIFY) == 0
         };
-        //CHECK what if the device removes the no_notify? maybe it's better not to reset it
-        //      also a double call to this function will return false the second time
+        
         self.num_added = 0;
 
         needs_kick
     }
 
+    /// Validates the segments of a descriptor chain.
     //CHECK the input->output order of the segments must be validated also
     //      for the direct then indirect layout, or only for the direct and indirect parts of it?
+    //      VIRTIO spec is not clear about this check
     //CHECK the maximum number of bytes of the chain must be validated also
     //      for the direct then indirect layout, or only for the direct and indirect parts of it?
+    //      VIRTIO spec is not clear about this check
     fn validate_segments(
         segments: &[DmaSegment],
     ) -> Result<(), VirtQueueError> {
@@ -831,6 +921,8 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         let mut seen_write = false;
 
         for segment in segments {
+            // SAFETY: segment.len is a u32, so it cannot overflow u64
+            // due to the next check.
             total_len = total_len + u64::from(segment.len);
 
             if total_len > (1u64 << 32) {
@@ -853,15 +945,20 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         Ok(())
     }
 
-    //TODO is it necessary? remove it otherwise
-    fn init_ring_state(&mut self) {
+    /// # Safety
+    ///
+    /// The caller must guarantee that the device can no longer access the
+    /// virtqueue or any outstanding descriptor chain and it has been reset.
+    unsafe fn init_ring_state(&mut self) {
         self.avail.set_flags(0);
         self.avail.set_idx(0);
         self.avail.set_used_event(0);
 
-        self.used.set_flags(0);
-        self.used.set_idx(0);
-        self.used.set_avail_event(0);
+        // SAFETY: The caller guarantees that the device can no longer access
+        // the virtqueue or any outstanding descriptor chain.
+        unsafe { 
+            self.used.reset(); 
+        }
     }
 
     /// Disables callbacks from the device.
@@ -872,26 +969,52 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
                 .set_used_event(self.last_used_idx.wrapping_sub(1));
         } else {
             self.avail
-                .set_flags(VIRTQ_AVAIL_F_NO_INTERRUPT);
+            .set_flags(VIRTQ_AVAIL_F_NO_INTERRUPT);
+        }
+    }
+    
+    pub fn enable_cb_delayed(&mut self) -> bool {
+        let outstanding =
+            self.avail_idx.wrapping_sub(self.last_used_idx);
+
+        //CHECK threshold taken from linux, we may want to tune it or set it at maximum outstanding requests
+        let threshold =
+            ((u32::from(outstanding) * 3) / 4) as u16;
+
+        self.enable_cb_after(threshold)
+    }
+
+    pub fn enable_cb_after(
+        &mut self,
+        threshold: u16,
+    ) -> bool {
+        let last_used_idx =
+            self.enable_cb_after_prepare(threshold);
+
+        self.hal.mb();
+
+        if self.event_idx {
+            let used = self.used.idx();
+            let completed =
+                used.wrapping_sub(last_used_idx);
+
+            completed <= threshold
+        } else {
+            !self.poll(last_used_idx)
         }
     }
 
-    pub fn virtqueue_enable_cb_delayed() {
-        //TODO
-    }
-
-    pub fn enable_cb_prepare(&mut self) -> u16 {
+    #[inline]
+    fn enable_cb_after_prepare(&mut self, threshold: u16) -> u16 {
         if self.event_idx {
-            self.avail.set_used_event(self.last_used_idx);
+            self.avail.set_used_event(
+                self.last_used_idx.wrapping_add(threshold),
+            );
         } else {
             self.avail.set_flags(0);
         }
 
         self.last_used_idx
-    }
-    
-    pub fn poll(&self, last_used_idx: u16) -> bool {
-        last_used_idx != self.used.idx()
     }
     
     /// Re-enables device callbacks.
@@ -900,27 +1023,36 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
     /// were being enabled. Returns `false` if the caller should process
     /// the queue again.
     pub fn enable_cb(&mut self) -> bool {
-        let last_used_idx = self.enable_cb_prepare();
+        self.enable_cb_after(0)
+    }
 
-        self.hal.mb();
-
-        !self.poll(last_used_idx)
+    fn poll(&self, last_used_idx: u16) -> bool {
+        last_used_idx != self.used.idx()
     }
     
-    /// Detaches one outstanding buffer that was not used by the device.
-    /// Should be called after the device has been reset and the driver has ensured that no more buffers will be used.
+    /// Detaches one outstanding request from a quiesced virtqueue.
+    /// This recycles its descriptor chain and returns the associated token.
     ///
     /// # Safety
     ///
     /// The caller must guarantee that the device can no longer access or
     /// consume descriptors from this virtqueue.
+    /// To be used upon reset and reuse of the virtqueue, after the device has been reset.
+    //CHECK we may want to remove this and keep take_outstanding_token for the teardown
+    //      since this is more expensive but keeps the state consistent, even though the reset
+    //      will clear everything regardless.
+    //      May be even better if virtqueue is broken, since recycle_chain may fail for corruption
     pub unsafe fn detach_unused(
         &mut self,
     ) -> Result<Option<Token>, VirtQueueError> {
         let mut head = None;
 
+        if self.broken {
+            return Err(VirtQueueError::BrokenVirtQueue);
+        }
+
         for index in 0..self.size {
-            if self.desc_state[usize::from(index)]
+            if self.desc_states()[usize::from(index)]
                 .token
                 .is_some()
             {
@@ -933,11 +1065,12 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
             return Ok(None);
         };
 
-        let token = self.desc_state[usize::from(head)]
+        let token = self.desc_states()[usize::from(head)]
             .token
             .ok_or(VirtQueueError::CorruptedDescriptor)?;
 
-        self.recycle_chain(head)?;
+        // SAFETY: The device has been reset.
+        unsafe { self.recycle_chain(head)? };
 
         self.avail_idx = self.avail_idx.wrapping_sub(1);
         self.avail.set_idx(self.avail_idx);
@@ -952,28 +1085,29 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
     ///
     /// The caller must guarantee that the device can no longer access the
     /// virtqueue or any outstanding descriptor chain.
-    //CHECK driver loses the saved tokens -> memory leak, should be called after looping detach unused
     pub unsafe fn reset_virtqueue_state(
         &mut self,
     ) -> Result<(), VirtQueueError> {
-        //CHECK this should prevent the call before the tokens have been detached
         if self.has_outstanding_requests() {
             return Err(VirtQueueError::QueueNotEmpty);
         }
 
-        for state in self.desc_state.iter_mut() {
-            if let Some(indirect) = state.indirect.take() {
-                unsafe {
-                    self.hal.dma_free(indirect.memory);
-                }
-            }
-        }
+        // SAFETY: The device has been reset and the driver has detached all outstanding requests.
+        unsafe { self.free_indirect_tables(); }
+
+        //CHECK we could directly zero out all the memory, as the VIRTIO spec says
 
         self.avail_idx = 0;
         self.last_used_idx = 0;
         self.num_added = 0;
+        self.broken = false;
 
-        self.init_ring_state();
+        // SAFETY:
+        // The caller guarantees that the device can no longer access the
+        // virtqueue or any outstanding descriptor chain.
+        unsafe {
+            self.init_ring_state();
+        }
 
         self.init_free_list();
 
@@ -983,7 +1117,7 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
     /// Returns whether the device has placed at least one entry in the used
     /// ring which has not yet been consumed by the driver.
     #[inline]
-    pub fn can_pop(&self) -> bool {
+    fn can_pop(&self) -> bool {
         self.last_used_idx != self.used.idx()
     }
 
@@ -1007,14 +1141,34 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 
     /// Returns whether the virtqueue has outstanding requests.
     #[inline]
-    pub fn has_outstanding_requests(&self) -> bool {
-        self.num_free != self.size
+    fn has_outstanding_requests(&self) -> bool {
+        self.desc_states()
+            .iter()
+            .any(DescState::is_request_head)
+    }
+
+    /// Returns whether the virtqueue is empty (all free descriptors).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.num_free == self.size
     }
 
     /// Returns whether the virtqueue has free descriptors.
     #[inline]
     pub fn has_free_descriptors(&self) -> bool {
         self.num_free != 0
+    }
+    
+    /// Returns whether the virtqueue is in a broken state.
+    #[inline]
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+    
+    /// Marks the virtqueue as broken.
+    #[inline]
+    fn mark_broken(&mut self) {
+        self.broken = true;
     }
 
     #[inline]
@@ -1024,13 +1178,74 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
     }
 
     #[inline]
+    fn desc_states(&self) -> &[DescState] {
+        // SAFETY:
+        // - `desc_state_memory` was allocated with sufficient size and
+        //   alignment for `self.size` DescState objects;
+        // - all elements were initialized in `new`;
+        // - the allocation remains alive for the lifetime of `self`.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.desc_state_memory
+                    .cpu_addr()
+                    .cast::<DescState>()
+                    .as_ptr(),
+                usize::from(self.size),
+            )
+        }
+    }
+
+    #[inline]
+    fn desc_states_mut(&mut self) -> &mut [DescState] {
+        // SAFETY:
+        // Same invariants as `desc_states`; `&mut self` guarantees
+        // exclusive access to the allocation.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.desc_state_memory
+                    .cpu_addr()
+                    .cast::<DescState>()
+                    .as_ptr(),
+                usize::from(self.size),
+            )
+        }
+    }
+
+    #[inline]
+    fn desc_extras(&self) -> &[DescExtra] {
+        unsafe {
+            core::slice::from_raw_parts(
+                self.desc_extra_memory
+                    .cpu_addr()
+                    .cast::<DescExtra>()
+                    .as_ptr(),
+                usize::from(self.size),
+            )
+        }
+    }
+
+    #[inline]
+    fn desc_extras_mut(&mut self) -> &mut [DescExtra] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.desc_extra_memory
+                    .cpu_addr()
+                    .cast::<DescExtra>()
+                    .as_ptr(),
+                usize::from(self.size),
+            )
+        }
+    }
+
+
+    #[inline]
     fn ring_memory(&self) -> Result<&DmaRegion, VirtQueueError> {
         self.ring_memory
             .as_ref()
             .ok_or(VirtQueueError::InvalidState)
     }
 
-    //TODO save directly the addresses instead of offsets, in particular if regions will be separeted
+    //CHECK save directly the addresses instead of offsets, in particular if regions will be separeted
     pub fn descriptor_dma_addr(&self) -> Result<DmaAddress, VirtQueueError> {
         Ok(self.ring_memory()?.dma_addr)
     }
@@ -1049,16 +1264,46 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
         )
     }
 
-    fn free_indirect_tables(&mut self) {
-        for state in self.desc_state.iter_mut() {
-            if let Some(indirect) = state.indirect.take() {
+    /// Frees all indirect tables that are still allocated.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that the device can no longer access
+    /// any of the indirect tables.
+    unsafe fn free_indirect_tables(&mut self) {
+        for i in 0..self.size {
+            let indirect = self.desc_states_mut()
+                [usize::from(i)]
+                .indirect
+                .take();
+
+            if let Some(indirect) = indirect {
                 // SAFETY:
-                // The device no longer accesses this queue.
+                // The caller guarantees that the device no longer
+                // accesses this indirect table.
                 unsafe {
                     self.hal.dma_free(indirect);
                 }
             }
         }
+    }
+
+    /// Removes and returns one outstanding request token or None if there are no outstanding requests.
+    /// Can be used even if the virtqueue is broken, to recover the token and free the descriptor chain.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that the device can no longer access
+    /// this virtqueue. 
+    /// To be used upon destruction of the virtqueue, after the device has been reset.
+    pub unsafe fn take_outstanding_token(&mut self) -> Option<Token> {
+        for state in self.desc_states_mut().iter_mut() {
+            if let Some(token) = state.token.take() {
+                return Some(token);
+            }
+        }
+
+        None
     }
 }
 
@@ -1066,9 +1311,18 @@ impl<'a, H: Hal> VirtQueue<'a, H> {
 //      if misused, moreover the driver loses the tokens
 //      we may want to remove this drop impl and make a dedicated function that can be called only after
 //      the device has been reset and the driver has detached all outstanding requests
-impl<H: Hal> Drop for VirtQueue<'_, H> {
+//TODO maybe the virtio framework should contain the virtqueue in a struct where it has to define 
+//     drop and perform device reset then this virtqueue drop when struct fields are dropped
+//     or directly define here the struct and the trait that implements the device reset and virtqueue drop
+impl<H: Hal> Drop for VirtQueue<H> {
     fn drop(&mut self) {
-        self.free_indirect_tables();
+
+        // SAFETY: The device has been reset and the driver has detached all outstanding requests.
+        unsafe { self.free_indirect_tables(); }
+
+        //CHECK drop_in_place() on the MemoryRegion may be necessary for future extensions on the Desc structs
+        //      to drop internal droppable fields: for example we may implement drop for DmaRegion and 
+        //      automatically drop the indirect tables too in the DescState
 
         if let Some(memory) = self.ring_memory.take() {
             // SAFETY:
@@ -1081,12 +1335,12 @@ impl<H: Hal> Drop for VirtQueue<'_, H> {
     }
 }
 
-// CHECK impl send and sync? Are they safe to implement?
+//CHECK impl send and sync? Are they safe to implement?
 //unsafe impl<H: Hal> Send for VirtQueue<H> {}
 //unsafe impl<H: Hal> Sync for VirtQueue<H> {}
 
 #[repr(C, align(16))]
-#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[derive(Copy, Clone)]
 pub(crate) struct Descriptor {
     addr: u64,
     len: u32,
@@ -1104,12 +1358,11 @@ struct vring_avail {
     u16 used_event; (VIRTIO_RING_F_EVENT_IDX)
 };
 */
-#[derive(Debug)]
 struct AvailRing {
     ptr: NonNull<u8>,
     size: u16,
 }
-//CHECK Atomics are really necessary? is volatile enough?
+
 impl AvailRing {
     /// # Safety
     ///
@@ -1119,11 +1372,11 @@ impl AvailRing {
         Self { ptr, size }
     }
 
-    fn flags_ptr(&self) -> *mut AtomicU16 {
+    fn flags_ptr(&self) -> *mut u16 {
         self.ptr.as_ptr().cast()
     }
 
-    fn idx_ptr(&self) -> *mut AtomicU16 {
+    fn idx_ptr(&self) -> *mut u16 {
         // SAFETY: `idx` immediately follows `flags`.
         unsafe {
             self.ptr
@@ -1143,7 +1396,7 @@ impl AvailRing {
         }
     }
 
-    fn used_event_ptr(&self) -> *mut AtomicU16 {
+    fn used_event_ptr(&self) -> *mut u16 {
         // SAFETY: used_event immediately follows ring[size].
         unsafe {
             self.ring_ptr()
@@ -1163,15 +1416,13 @@ impl AvailRing {
                 descriptor.to_le(),
             );
         }
-
-        Ok(())
     }
 
     fn set_idx(&self, idx: u16) {
         unsafe {
-            (*self.idx_ptr()).store(
+            core::ptr::write_volatile(
+                self.idx_ptr(),
                 idx.to_le(),
-                Ordering::Release,
             );
         }
     }
@@ -1179,14 +1430,20 @@ impl AvailRing {
     fn set_flags(&self, flags: u16) {
         // SAFETY: `flags_ptr` points to the valid available-ring flags.
         unsafe {
-            (*self.flags_ptr()).store(flags.to_le(), Ordering::Release);
+            core::ptr::write_volatile(
+                self.flags_ptr(),
+                flags.to_le(),
+            );
         }
     }
 
     fn set_used_event(&self, idx: u16) {
-        // SAFETY: `used_event_ptr` points to the event-index field.
+        // SAFETY: `used_event_ptr` points to the valid event-index field.
         unsafe {
-            (*self.used_event_ptr()).store(idx.to_le(), Ordering::Release);
+            core::ptr::write_volatile(
+                self.used_event_ptr(),
+                idx.to_le(),
+            );
         }
     }
 }
@@ -1201,7 +1458,6 @@ struct vring_used {
     u16 avail_event;  (opzionale)
 };
 */
-#[derive(Debug)]
 struct UsedRing {
     ptr: NonNull<u8>,
     size: u16,
@@ -1215,11 +1471,11 @@ impl UsedRing {
         Self { ptr, size }
     }
 
-    fn flags_ptr(&self) -> *mut AtomicU16 {
+    fn flags_ptr(&self) -> *mut u16 {
         self.ptr.as_ptr().cast()
     }
 
-    fn idx_ptr(&self) -> *mut AtomicU16 {
+    fn idx_ptr(&self) -> *mut u16 {
         // SAFETY: `idx` immediately follows `flags`.
         unsafe {
             self.ptr
@@ -1229,27 +1485,26 @@ impl UsedRing {
         }
     }
 
-    fn set_idx(&self, idx: u16) {
-        /*unsafe {
+    /// # Safety
+    ///
+    /// The caller must guarantee that the device can no longer access the
+    /// used ring or any outstanding descriptor chain.
+    unsafe fn reset(&self) {
+        unsafe {
+            core::ptr::write_volatile(
+                self.flags_ptr(),
+                0u16.to_le(),
+            );
+
             core::ptr::write_volatile(
                 self.idx_ptr(),
-                idx.to_le(),
+                0u16.to_le(),
             );
-        }*/
-        unsafe {
-            (*self.idx_ptr()).store(idx.to_le(), Ordering::Release);
-        }
-    }
 
-    fn set_flags(&self, flags: u16) {
-        unsafe {
-            (*self.flags_ptr()).store(flags.to_le(), Ordering::Release);
-        }
-    }
-
-    fn set_avail_event(&self, idx: u16) {
-        unsafe {
-            (*self.avail_event_ptr()).store(idx.to_le(), Ordering::Release);
+            core::ptr::write_volatile(
+                self.avail_event_ptr(),
+                0u16.to_le(),
+            );
         }
     }
 
@@ -1263,7 +1518,7 @@ impl UsedRing {
         }
     }
 
-    fn avail_event_ptr(&self) -> *mut AtomicU16 {
+    fn avail_event_ptr(&self) -> *mut u16 {
         // SAFETY: avail_event immediately follows ring[size].
         unsafe {
             self.ring_ptr()
@@ -1274,14 +1529,14 @@ impl UsedRing {
 
     fn idx(&self) -> u16 {
         u16::from_le(unsafe {
-            (*self.idx_ptr()).load(Ordering::Acquire)
+            core::ptr::read_volatile(self.idx_ptr())
         })
     }
 
     fn flags(&self) -> u16 {
-        // SAFETY: `flags_ptr` points to valid used-ring flags.
+        // SAFETY: `flags_ptr` points to the valid used-ring flags field.
         u16::from_le(unsafe {
-            (*self.flags_ptr()).load(Ordering::Acquire)
+            core::ptr::read_volatile(self.flags_ptr())
         })
     }
 
@@ -1306,24 +1561,22 @@ impl UsedRing {
     }
 
     fn avail_event(&self) -> u16 {
-        // SAFETY: `avail_event_ptr` points to the event-index field.
+        // SAFETY: `avail_event_ptr` points to the valid event-index field.
         u16::from_le(unsafe {
-            (*self.avail_event_ptr()).load(Ordering::Acquire)
+            core::ptr::read_volatile(self.avail_event_ptr())
         })
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Copy, Clone)]
 struct UsedElem {
     id: u32,
     len: u32,
 }
 
-#[derive(
-    Copy, Clone, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
-)]
 #[repr(transparent)]
+#[derive(Copy, Clone)]
 struct DescFlags(u16);
 
 bitflags! {
@@ -1334,19 +1587,20 @@ bitflags! {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub enum VirtQueueError {
     MemoryAllocationFailed,
     InvalidQueueSize,
     InvalidParam,
     QueueFull,
+    QueueNotEmpty,
     FeatureNotNegotiated,
     CorruptedDescriptor,
     InvalidState,
     CorruptedUsedElem,
+    BrokenVirtQueue,
 }
 
-#[derive(Debug)]
 pub enum Error<E> {
     Queue(VirtQueueError),
     Hal(E),
@@ -1358,12 +1612,13 @@ impl<E> From<VirtQueueError> for Error<E> {
     }
 }
 
-//CHECK changed from rcore -> now buffers are mapped outside and directly passed to the 
-//      virtqueue functions => less safety (we lose the lifetimes) more flexibilty
+//CHECK changed from rcore -> buffers are mapped outside and directly passed to the 
+//      virtqueue functions => less safety (we lose the lifetimes) more flexibilty.
 //      caller is responsible for mapping the addresses outside virtqueue core logic,
 //      caller prepares DmaSegment(s), may be helpful for VIRTIO_F_ACCESS_PLATFORM,
-//      IOMMU implementations, particular Dma mappings without chaing the core logic.
-//      Maybe it's better to implement a DMA mapping function in HAL trait?
+//      IOMMU implementations, particular Dma mappings without the need 
+//      of chainging the core logic. Virtqueue core only implements the logic.
+//      Can be extended in the future to support buffer mappings inside virtqueue core logic.
 pub struct DmaSegment {
     dma_addr: DmaAddress,
     len: u32,
@@ -1385,7 +1640,7 @@ impl DmaSegment {
 }
 
 //CHECK input and output buffer better names?
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub enum BufferDirection {
     DriverToDevice,
     DeviceToDriver,
@@ -1399,6 +1654,11 @@ fn queue_part_sizes(
     }
 
     let n = usize::from(queue_size);
+    // SAFETY:
+    // - `n` is a power of 2 and `n <= 2^15`, so `n + 3 < 2^16`.
+    // - size_of::<Descriptor>() is 16.
+    // - size_of::<u16>() is 2.
+    // - size_of::<UsedElem>() is 8.
     let desc = size_of::<Descriptor>() * n;
     let avail = size_of::<u16>() * (n + 3);
     let used = size_of::<u16>() * 3 + size_of::<UsedElem>() * n;
@@ -1416,15 +1676,19 @@ fn align_up(
         return Err(VirtQueueError::InvalidParam);
     }
 
-    //CHECK can this wrap around? in case add a check
+    if align - 1 > usize::MAX - value {
+        return Err(VirtQueueError::InvalidParam);
+    }
+
     let adjusted = value + align - 1;
 
     Ok(adjusted & !(align - 1))
 }
 
+/// per-request, meaningful on the head
 struct DescState {
     token: Option<Token>,
-    indirect: Option<IndirectState>,
+    indirect: Option<DmaRegion>,
 }
 
 impl DescState {
@@ -1435,18 +1699,14 @@ impl DescState {
         }
     }
     
-    //TODO rename it?
     #[inline]
     fn is_request_head(&self) -> bool {
         self.token.is_some()
     }
 }
 
-struct IndirectState {
-    memory: DmaRegion,
-}
-
-#[derive(Clone, Copy)]
+/// per-descriptor
+#[derive(Copy, Clone)]
 struct DescExtra {
     next: u16,
 }
@@ -1475,6 +1735,7 @@ impl Token {
     }
 }
 
+/// `indirect_from` must be the index of the first indirect descriptor.
 pub enum DescriptorLayout {
     Direct,
     Indirect,
@@ -1488,6 +1749,15 @@ pub struct VirtQueueFeatures {
     pub indirect: bool,
 }
 
+
+/*** 
+*
+*
+* Extra features and optimizations that may be implemented in the future.
+*
+*
+***/
+
 //TODO possible legacy support as argument to new
 pub enum QueueLayout {
     Modern,
@@ -1495,3 +1765,71 @@ pub enum QueueLayout {
         align: usize,
     },
 }
+
+//TODO possible optimization for recyling a chain in O(1) instead of O(n).
+//     To be returned by the add_* functions
+//     then save these data in the desc_state, to be used in recycle_chain
+//     without reading the possible corrupted state from descriptors.
+//     Otherwise we may use a sentinel guard in DescExtra to find the last descriptor in a chain 
+//     from desc_extras instead of Dma shared memory
+#[derive(Copy, Clone)]
+struct DescriptorChain {
+    head: u16,
+    last: u16,
+    num: u16,
+}
+
+//TODO possible optimization for indirect table memory allocation in DescState. We dont
+//     need Dma Coherent memory for the indirect table, so we may use Hal::alloc()
+//     and then map it to Dma address with Hal::dma_map() and unmap it with Hal::dma_unmap()
+//     this also supports future extensions for buffer mappings inside virtqueue core logic
+//     and the drop implementation for the indirect table memory
+/*
+* In HAL:
+* pub struct DmaMapping {
+*   dma_addr: DmaAddress,
+*   size: usize,
+*   direction: DmaDirection,
+* }
+* pub enum DmaDirection {
+*     ToDevice,
+*     FromDevice,
+*     Bidirectional,
+* }
+*/
+struct IndirectState<H: Hal> {
+    memory: MemoryRegion<H>,
+    mapping: DmaMapping,
+}
+
+/*
+//CHECK recycle chain optimized and with no errors returned
+fn recycle_chain(&mut self, head: u16) {
+    let state = &mut self.desc_state[usize::from(head)];
+
+    let num = state.num;
+    let last = state.last;
+
+    debug_assert!(state.token.is_some());
+    debug_assert!(num != 0);
+    debug_assert!(last < self.size);
+    debug_assert!(num <= self.size - self.num_free);
+
+    self.desc_extra[usize::from(last)].next = self.free_head;
+    self.free_head = head;
+    self.num_free += num;
+
+    state.token = None;
+    state.num = 0;
+    state.last = 0;
+
+    if let Some(indirect) = state.indirect.take() {
+        // SAFETY:
+        // The device has completed the request, so it can no longer
+        // access the indirect descriptor table.
+        unsafe {
+            self.hal.dma_free(indirect);
+        }
+    }
+}
+    */
