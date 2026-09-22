@@ -5,19 +5,43 @@
 //! This trait defines the OS-specific operations needed by the
 //! virtqueue logic. Implement this trait for each target OS.
 
-pub type DmaAddress = u64;
+use core::{
+    marker::PhantomData,
+    ptr::NonNull,
+};
+
+/// A DMA-accessible memory address.
+pub(super) type DmaAddress = u64;
 //TODO cpu and dma address, virtaddr and physaddr, or vaddr and paddr?
 //TODO impl Drop for DmaRegion to automatically free the memory when out of scope?
+/// A DMA-accessible memory region.
 pub struct DmaRegion {
+    /// The CPU-accessible address of the memory region.
     pub cpu_addr: core::ptr::NonNull<u8>,
+    /// The device-accessible address of the memory region.
     pub dma_addr: DmaAddress,
+    /// The size of the memory region in bytes.
     pub size: usize,
 }
 
+impl DmaRegion {
+    pub(super) unsafe fn new(
+        cpu_addr: NonNull<u8>,
+        dma_addr: DmaAddress,
+        size: usize,
+    ) -> Self {
+        Self {
+            cpu_addr,
+            dma_addr,
+            size,
+        }
+    }
+}
+
 pub struct MemoryRegion<A: Allocator> {
-    cpu_addr: NonNull<u8>,
-    size: usize,
-    align: usize,
+    pub cpu_addr: NonNull<u8>,
+    pub size: usize,
+    pub align: usize,
     // This field is used to determine which allocator should handle the drop of this MemoryRegion.
     _allocator: PhantomData<A>,
 }
@@ -50,12 +74,18 @@ pub unsafe trait Allocator {
         align: usize,
     );
 
-    /// Allocate a DMA-capable memory region of `size` bytes.
+    /// Allocate a DMA-accessible memory region of `size` bytes.
     ///
     /// Returns a [`DmaRegion`] containing the size and both 
     /// the CPU-accessible address and the device-accessible address.
     ///
-    /// The memory must be zeroed.  ***TODO to decide***
+    /// On success, the returned region must:
+    /// - contain at least `size` bytes.
+    /// - satisfy the requested alignment.
+    /// - be accessible by both CPU and device.
+    /// - not require explicit cache synchronization for ordinary virtqueue.
+    ///   shared-memory accesses.
+    /// - be zero-initialized.  ***TODO to decide***
     fn dma_alloc(
         &self,
         size: usize,
@@ -135,7 +165,8 @@ impl<A: Allocator> Drop for MemoryRegion<A> {
 /// - `read_barrier` ensures all preceding device writes are visible to the CPU.
 pub unsafe trait Hal: Allocator {
 
-    type Error;
+    //CHECK at the moment it's useless
+    // type Error;
     
     //TODO linux implements weak barriers with VIRTIO_F_ORDER_PLATFORM feature
     //     add extra param to barrier functions to implement this feature if needed
@@ -146,7 +177,7 @@ pub unsafe trait Hal: Allocator {
     /// available ring are visible to the device before it processes them.
     ///
     /// Equivalent to `virtio_wmb()` in the C kernel.
-    fn write_barrier();
+    fn write_barrier(&self);
 
     /// Issue a read memory barrier.
     ///
@@ -154,7 +185,7 @@ pub unsafe trait Hal: Allocator {
     /// the CPU before we read them.
     ///
     /// Equivalent to `virtio_rmb()` in the C kernel.
-    fn read_barrier();
+    fn read_barrier(&self);
 
     /// Full memory barrier for device-visible shared memory.
     fn mb(&self);

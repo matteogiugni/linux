@@ -12,6 +12,10 @@ use crate::{
     bindings,
     device_id::RawDeviceId,
     error::{
+        code::{
+            EINVAL,
+            ENOTSUPP,
+        },
         from_result,
         to_result,
         Error,
@@ -19,16 +23,22 @@ use crate::{
     },
     ffi::c_uint,
     prelude::*,
+    sync::aref::ARef,
     types::Opaque, //
 };
 
 use core::{
+    cell::UnsafeCell,
     marker::PhantomData,
     pin::Pin,
     ptr::NonNull, //
 };
 
+use self::virtqueue::{LinuxHal, VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC};
+
+/// Utilities for VIRTIO.
 pub mod utils;
+/// VirtQueue implementation for Linux.
 pub mod virtqueue;
 
 /// IdTable type for virtio drivers.
@@ -186,6 +196,35 @@ unsafe impl<Ctx: crate::device::DeviceContext> crate::device::AsBusDevice<Ctx> f
 // argument.
 kernel::impl_device_context_deref!(unsafe { Device });
 
+/*
+TODO 
+kernel::impl_device_context_into_aref!(Device);
+
+unsafe impl crate::sync::aref::AlwaysRefCounted for Device {
+    fn inc_ref(&self) {
+        // SAFETY:
+        // `raw_device()` points to the embedded struct device and
+        // the existence of `&self` guarantees a live reference.
+        unsafe {
+            bindings::get_device(self.raw_device());
+        }
+    }
+
+    unsafe fn dec_ref(obj: NonNull<Self>) {
+        let vdev = obj.cast::<bindings::virtio_device>().as_ptr();
+
+        // SAFETY:
+        // `vdev` is valid while this reference is owned.
+        let dev = unsafe {
+            core::ptr::addr_of_mut!((*vdev).dev)
+        };
+
+        unsafe {
+            bindings::put_device(dev);
+        }
+    }
+}*/
+
 impl<Ctx: crate::device::DeviceContext> Device<Ctx> {
     /// Returns the `DeviceId` associated with this VirtIO device.
     #[inline]
@@ -228,30 +267,7 @@ impl<Ctx: crate::device::DeviceContext> Device<Ctx> {
         unsafe { bindings::virtio_device_ready(self.as_raw()) }
     }
 
-    /// Return virtqueues for this device.
-    #[doc(alias = "virtio_find_vqs")]
-    pub fn find_vqs(&self, info: &[virtqueue::VirtqueueInfo]) -> Result<virtqueue::Virtqueues> {
-        let mut vqs = KVec::with_capacity(info.len(), GFP_KERNEL)?;
-        // SAFETY: By its type invariant `self.as_raw` is always a valid pointer to a
-        // `struct virtio_device`.
-        to_result(unsafe {
-            bindings::virtio_find_vqs(
-                self.as_raw(),
-                info.len().try_into()?,
-                vqs.spare_capacity_mut().as_mut_ptr().cast(),
-                info.as_ptr().cast_mut().cast(),
-                core::ptr::null_mut(),
-            )
-        })?;
-        // SAFETY: virtio_find_vqs returned successfully so `vqs` must be populated.
-        unsafe { vqs.inc_len(info.len()) };
-        let mut inner = KVec::with_capacity(vqs.len(), GFP_KERNEL)?;
-        for vq in vqs {
-            inner.push(NonNull::new(vq).ok_or(EINVAL)?, GFP_KERNEL)?;
-        }
-        Ok(virtqueue::Virtqueues { inner })
-    }
-
+    /*
     /// Delete virtqueues from this device.
     pub(crate) fn del_vqs(&self) {
         // SAFETY: By its type invariant `self.as_raw` is always a valid pointer to a
@@ -263,7 +279,7 @@ impl<Ctx: crate::device::DeviceContext> Device<Ctx> {
             // `struct virtio_device`.
             unsafe { del_vqs(self.as_raw()) }
         }
-    }
+    }*/
 
     /// Checks if the device has a feature bit.
     #[inline]
@@ -271,6 +287,268 @@ impl<Ctx: crate::device::DeviceContext> Device<Ctx> {
         // SAFETY: By its type invariant `self.as_raw` is always a valid pointer to a
         // `struct virtio_device`.
         unsafe { bindings::virtio_has_feature(self.as_raw(), fbit) }
+    }
+
+    /// Returns the DMA device associated with this VirtIO device.
+    pub fn dma_device(
+        &self,
+    ) -> Result<&crate::device::Device<crate::device::Bound>> {
+        let parent = self
+            .as_ref()
+            .parent()
+            .ok_or(ENODEV)?;
+
+        // SAFETY:
+        // A virtio_device exists while its transport device is bound.
+        // The parent is the transport device backing this VirtIO device
+        // and remains alive for the lifetime of the VirtIO device.
+        Ok(unsafe {
+            crate::device::Device::<crate::device::Bound>::from_raw(
+                parent.as_raw(),
+            )
+        })
+    }
+}
+
+impl Device<crate::device::Core> {
+    /// Return virtqueues for this device.
+    #[doc(alias = "virtio_find_vqs")]
+    pub fn find_vqs(
+        &self,
+        info: &[VirtqueueInfo],
+    ) -> Result<Virtqueues> {
+        // SAFETY:
+        // By the Device type invariant, self.as_raw() points to a valid
+        // struct virtio_device and its config pointer is valid.
+        let config = unsafe {
+            &*(*self.as_raw()).config
+        };
+
+        let prepare = config
+            .prepare_rust_vqs
+            .ok_or(ENOTSUPP)?;
+
+        let setup = config
+            .setup_rust_vqs
+            .ok_or(ENOTSUPP)?;
+
+        // Teardown support is required if setup succeeds.
+        config
+            .del_rust_vqs
+            .ok_or(ENOTSUPP)?;
+
+        /*
+        * Build the descriptions passed to the transport.
+        *
+        * At this point only the driver-provided queue name is known.
+        */
+        let mut configs =
+            KVec::with_capacity(info.len(), GFP_KERNEL)?;
+
+        for vqi in info {
+            // Context support is not implemented by the Rust virtqueue yet.
+            if vqi.ctx {
+                return Err(ENOTSUPP);
+            }
+
+            configs.push(
+                bindings::virtio_rust_vq_info {
+                    name: vqi.name.as_char_ptr(),
+
+                    // Filled by prepare_rust_vqs().
+                    index: 0,
+                    size: 0,
+
+                    // Filled after constructing the Rust VirtQueue.
+                    desc_addr: 0,
+                    avail_addr: 0,
+                    used_addr: 0,
+
+                    // Filled after every Virtqueue has reached its final address.
+                    interrupt: None,
+                    interrupt_data: core::ptr::null_mut(),
+
+                    // Filled ?.
+                    notify: None,
+                    notify_data: core::ptr::null_mut(),
+                },
+                GFP_KERNEL,
+            )?;
+        }
+
+        /*
+        * CALL 1.
+        *
+        * Transport discovery only: obtain hardware queue index and size.
+        * This call must not enable queues or install IRQ state.
+        */
+        to_result(unsafe {
+            prepare(
+                self.as_raw(),
+                configs.len().try_into()?,
+                configs.as_mut_ptr(),
+            )
+        })?;
+
+        let event_idx =
+            self.has_feature(VIRTIO_RING_F_EVENT_IDX);
+
+        let indirect =
+            self.has_feature(VIRTIO_RING_F_INDIRECT_DESC);
+
+        /*
+        * Create all Rust virtqueues.
+        *
+        * Capacity is fixed to the final number of queues. Once this loop
+        * succeeds, `inner` is never resized, so pointers to its Virtqueue
+        * elements remain stable until transport teardown.
+        */
+        let mut inner =
+            KVec::with_capacity(info.len(), GFP_KERNEL)?;
+
+        for (cfg, vqi) in configs.iter().zip(info.iter()) {
+            let hal = LinuxHal::new(self)?;
+
+            let queue = virtqueue::VirtQueue::new(
+                hal,
+                cfg.index.try_into()?,
+                cfg.size,
+                virtqueue::VirtQueueFeatures {
+                    event_idx,
+                    indirect,
+                },
+            )
+            .map_err(Self::map_virtqueue_error)?;
+
+            inner.push(
+                VirtQueue {
+                    inner: UnsafeCell::new(queue),
+
+                    // SAFETY:
+                    // Device::as_raw() is non-null by the Device type invariant.
+                    vdev: unsafe {
+                        NonNull::new_unchecked(self.as_raw())
+                    },
+
+                    callback: vqi.callback,
+                    // Transport state is installed only after setup_rust_vqs()
+                    // completes successfully.
+                    notify: None,
+                    notify_data: core::ptr::null_mut(),
+                },
+                GFP_KERNEL,
+            )?;
+        }
+
+        /*
+        * Every Virtqueue now has its final address.
+        *
+        * Fill in the ring DMA addresses and the Rust equivalent of
+        * vring_interrupt().
+        */
+        for i in 0..inner.len() {
+            {
+                let core_vq =
+                    inner[i].inner.get_mut();
+
+                configs[i].desc_addr =
+                    core_vq
+                        .descriptor_dma_addr()
+                        .map_err(|_| EINVAL)?;
+
+                configs[i].avail_addr =
+                    core_vq
+                        .driver_area_dma_addr()
+                        .map_err(|_| EINVAL)?;
+
+                configs[i].used_addr =
+                    core_vq
+                        .device_area_dma_addr()
+                        .map_err(|_| EINVAL)?;
+            }
+
+            if inner[i].callback.is_some() {
+                let vq =
+                    core::ptr::from_mut(&mut inner[i]);
+
+                configs[i].interrupt =
+                    Some(rust_vring_interrupt);
+
+                configs[i].interrupt_data =
+                    vq.cast();
+            }
+        }
+
+        /*
+        * CALL 2.
+        *
+        * The transport may now configure MSI-X/INTx state, program the
+        * ring addresses and enable the queues.
+        *
+        * On failure, setup_rust_vqs() must completely roll back any
+        * transport resources it created. `inner` is then dropped normally.
+        */
+        let mut transport_data =
+            core::ptr::null_mut();
+
+        to_result(unsafe {
+            setup(
+                self.as_raw(),
+                configs.len().try_into()?,
+                configs.as_mut_ptr(),
+                core::ptr::null_mut(), // irq_affinity unsupported for now
+                &mut transport_data,
+            )
+        })?;
+
+        /*
+        * CALL 2 succeeded.
+        *
+        * The transport state is now complete and owns the per-VQ notify
+        * mappings. Publish the non-owning notify handles into the Rust
+        * wrappers.
+        *
+        * Nothing in this loop may fail.
+        */
+        for i in 0..inner.len() {
+            inner[i].notify = configs[i].notify;
+            inner[i].notify_data = configs[i].notify_data;
+        }
+
+        /*
+        * IMPORTANT:
+        * Nothing fallible after setup_rust_vqs() succeeds.
+        */
+        Ok(Virtqueues {
+            inner,
+            transport_data,
+
+            // SAFETY:
+            // Device::as_raw() is non-null by its type invariant.
+            vdev: unsafe {
+                NonNull::new_unchecked(self.as_raw())
+            },
+
+            _device: unsafe {
+                // SAFETY:
+                // `self.raw_device()` points to the embedded `struct device`
+                // of this live VirtIO device. Since `self` is alive here, its
+                // device reference count is non-zero. `get_device()` acquires
+                // an independent reference which is held by `Virtqueues`.
+                crate::device::Device::get_device(
+                    self.raw_device(),
+                )
+            },
+        })
+    }
+
+    fn map_virtqueue_error(
+        err: virtqueue::Error<Error>,
+    ) -> Error {
+        match err {
+            virtqueue::Error::Hal(err) => err,
+            virtqueue::Error::Queue(_) => EINVAL,
+        }
     }
 }
 
@@ -377,6 +655,364 @@ impl<T: Driver + 'static> Adapter<T> {
 
         T::scan(dev, data);
     }
+}
+
+/// Virtqueue callback function for interrupt handling.
+pub type VirtqueueCallback = fn(&VirtQueue);
+
+/// A struct to hold the information needed to create a virtqueue.
+pub struct VirtqueueInfo {
+    pub(crate) name: &'static CStr,
+    pub(crate) ctx: bool,
+    pub(crate) callback: Option<VirtqueueCallback>,
+}
+
+impl VirtqueueInfo {
+    /// Create a new virtqueue info struct.
+    pub const fn new(
+        name: &'static CStr,
+        ctx: bool,
+        callback: Option<VirtqueueCallback>,
+    ) -> Self {
+        Self {
+            name,
+            ctx,
+            callback,
+        }
+    }
+}
+
+/// A function that is called when a virtqueue needs to be notified.
+type VirtqueueNotify =
+    unsafe extern "C" fn(*mut core::ffi::c_void, u32) -> bool;
+
+/// Linux-specific VirtIO virtqueue.
+///
+/// `inner` contains the portable Rust virtqueue implementation, while
+/// this wrapper stores the Linux VirtIO state associated with it.
+pub struct VirtQueue {
+    inner: UnsafeCell<virtqueue::VirtQueue<LinuxHal>>,
+    callback: Option<VirtqueueCallback>,
+    vdev: NonNull<bindings::virtio_device>,
+    notify: Option<VirtqueueNotify>,
+    notify_data: *mut core::ffi::c_void,
+}
+
+impl VirtQueue {
+    /// Returns a reference to the underlying `bindings::virtio_device` type.
+    #[inline]
+    pub fn dev(&self) -> &Device<crate::device::Bound> {
+        // SAFETY:
+        // The queue belongs to this VirtIO device. Callbacks can only be
+        // delivered while the device and the queue are alive.
+        unsafe {
+            &*self
+                .vdev
+                .as_ptr()
+                .cast::<Device<crate::device::Bound>>()
+        }
+    }
+
+    #[inline]
+    fn with_inner<R>(
+        &self,
+        f: impl FnOnce(&virtqueue::VirtQueue<LinuxHal>) -> R,
+    ) -> R {
+        // SAFETY:
+        // VirtQueue operations follow the virtqueue no-reentry
+        // requirement. Shared access is limited to this call.
+        unsafe { f(&*self.inner.get()) }
+    }
+
+    #[inline]
+    fn with_inner_mut<R>(
+        &self,
+        f: impl FnOnce(&mut virtqueue::VirtQueue<LinuxHal>) -> R,
+    ) -> R {
+        // SAFETY:
+        // VirtQueue operations follow the virtqueue no-reentry
+        // requirement. The mutable reference does not escape this call.
+        unsafe { f(&mut *self.inner.get()) }
+    }
+
+    #[inline]
+    fn is_broken(&self) -> bool {
+        self.with_inner(|inner| inner.is_broken())
+    }
+
+    #[inline]
+    fn can_pop(&self) -> bool {
+        self.with_inner(|inner| inner.can_pop())
+    }
+
+    fn notify_with_data(
+        &self,
+        notification_data: u32,
+    ) -> bool {
+        if self.is_broken() {
+            return false;
+        }
+
+        let Some(notify) = self.notify else {
+            return false;
+        };
+
+        if !unsafe {
+            notify(self.notify_data, notification_data)
+        } {
+            self.with_inner_mut(|inner| {
+                inner.mark_broken();
+            });
+
+            return false;
+        }
+
+        true
+    }
+
+    /// Notify the device that new buffers are available.
+    pub fn notify(&self) -> bool {
+        let notification_data =
+            self.with_inner(|inner| {
+                inner.notification_data()
+            });
+
+        self.notify_with_data(notification_data)
+    }
+
+    /// Notify the device that new buffers are available, but only if the device has used some buffers.
+    pub fn kick(&self) -> bool {
+        /*
+        let notification_data =
+            self.with_inner_mut(|inner| {
+                if inner.kick_prepare() {
+                    Some(inner.notification_data())
+                } else {
+                    None
+                }
+            });
+
+        let Some(notification_data) =
+            notification_data
+        else {
+            return true;
+        };
+
+        self.notify_with_data(notification_data)
+        */
+        // TODO DELETE FROM HERE ON
+        let (
+            avail_idx,
+            avail_event,
+            used_idx,
+            last_used_idx,
+            needs_kick,
+            notification_data,
+        ) = self.with_inner_mut(|inner| {
+            let avail_idx = inner.debug_avail_idx();
+            let avail_event = inner.debug_avail_event();
+            let used_idx = inner.debug_used_idx();
+            let last_used_idx = inner.debug_last_used_idx();
+
+            let needs_kick = inner.kick_prepare();
+            let notification_data =
+                inner.notification_data();
+
+            (
+                avail_idx,
+                avail_event,
+                used_idx,
+                last_used_idx,
+                needs_kick,
+                notification_data,
+            )
+        });
+
+        pr_info!(
+            "vq: avail={} avail_event={} used={} last_used={} kick={}\n",
+            avail_idx,
+            avail_event,
+            used_idx,
+            last_used_idx,
+            needs_kick
+        );
+
+        if !needs_kick {
+            pr_info!("virtqueue: MMIO notify suppressed\n");
+            return true;
+        }
+
+        pr_info!("virtqueue: doing MMIO notify\n");
+
+        self.notify_with_data(notification_data)
+    }
+
+    /// Adds one device-writable DMA buffer.
+    ///
+    /// # Safety
+    ///
+    /// `dma_addr..dma_addr + len` must remain a valid DMA mapping for this
+    /// device until the request is returned by `get_buf()`.
+    pub unsafe fn add_inbuf(
+        &self,
+        dma_addr: crate::dma::DmaAddress,
+        len: u32,
+        token: virtqueue::Token,
+    ) -> Result {
+        self.with_inner_mut(|inner| {
+            // SAFETY:
+            // Forwarded from this function's safety requirements.
+            unsafe {
+                inner.add_inbuf(
+                    dma_addr,
+                    len,
+                    token,
+                    virtqueue::DescriptorLayout::Direct,
+                )
+            }
+        })
+        .map_err(|err| match err {
+            virtqueue::Error::Hal(err) => err,
+            virtqueue::Error::Queue(_) => EIO,
+        })
+    }
+
+    /// Gets one used buffer from the device.
+    pub fn get_buf(
+        &self,
+    ) -> Result<Option<(virtqueue::Token, u32)>> {
+        self.with_inner_mut(|inner| {
+            inner.get_buf()
+        })
+        .map_err(|_| EIO)
+    }
+}
+
+/// A collection of virtqueues for a given virtio device.
+pub struct Virtqueues {
+    inner: KVec<VirtQueue>,
+
+    transport_data: *mut core::ffi::c_void,
+
+    vdev: NonNull<bindings::virtio_device>,
+
+    // Keeps the underlying device alive until all queues have been destroyed.
+    _device: ARef<crate::device::Device>,
+
+    //TODO make virtio device ARef counted
+    // device: ARef<Device>,
+}
+
+impl core::ops::Deref for Virtqueues {
+    type Target = [VirtQueue];
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Virtqueues {
+    /// Get the virtqueue at the given index.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&VirtQueue> {
+        self.inner.get(index)
+    }
+
+    /// Get the mutable virtqueue at the given index.
+    #[inline]
+    pub fn get_mut(
+        &mut self,
+        index: usize,
+    ) -> Option<&mut VirtQueue> {
+        self.inner.get_mut(index)
+    }
+
+    /// Get the number of virtqueues in this collection.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns `true` if the collection is empty, `false` otherwise.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl Drop for Virtqueues {
+    fn drop(&mut self) {
+        let vdev = self.vdev.as_ptr();
+
+        pr_info!("virtio: Virtqueues::drop: reset begin\n");
+        //TODO decide if remove_callback should call the reset
+        // Stop device DMA/interrupt generation first.
+        unsafe {
+            bindings::virtio_reset_device(vdev);
+        }
+
+        pr_info!("virtio: Virtqueues::drop: reset done\n");
+
+        let config = unsafe { (*vdev).config };
+
+        if let Some(del_rust_vqs) =
+            unsafe { (*config).del_rust_vqs }
+        {
+
+            pr_info!(
+                "virtio: Virtqueues::drop: transport teardown begin\n"
+            );
+            // SAFETY:
+            // transport_data was returned by setup_rust_vqs() for this device.
+            // Virtqueue objects are still alive while transport IRQ state is
+            // being destroyed.
+            unsafe {
+                del_rust_vqs(
+                    vdev,
+                    self.transport_data,
+                );
+            }
+
+            pr_info!(
+                "virtio: Virtqueues::drop: transport teardown done\n"
+            );
+        }
+
+        //TODO tokens teardown
+        
+        pr_info!(
+            "virtio: Virtqueues::drop: core virtqueues about to drop\n"
+        );
+        /*
+         * After Drop::drop returns:
+         *
+         *     inner -> Virtqueue -> VirtQueue<LinuxHal>
+         *
+         * are destroyed automatically.
+         */
+    }
+}
+
+unsafe extern "C" fn rust_vring_interrupt(
+    data: *mut core::ffi::c_void,
+) -> bool {
+    let vq = unsafe {
+        &*data.cast::<VirtQueue>()
+    };
+
+    if !vq.can_pop() {
+        return false;
+    }
+
+    if vq.is_broken() {
+        return true;
+    }
+
+    if let Some(callback) = vq.callback {
+        callback(vq);
+    }
+
+    true
 }
 
 /// Any vendor
