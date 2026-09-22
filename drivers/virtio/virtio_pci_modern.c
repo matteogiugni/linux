@@ -1224,6 +1224,728 @@ int virtio_pci_admin_dev_parts_set(struct pci_dev *pdev, struct scatterlist *dat
 }
 EXPORT_SYMBOL_GPL(virtio_pci_admin_dev_parts_set);
 
+static bool vp_modern_notify(
+    void *data,
+    u32 notification_data)
+{
+    struct virtio_pci_rust_vq *vq = data;
+	(void)notification_data;
+
+    iowrite16(vq->index, vq->notify);
+
+    return true;
+}
+
+static bool vp_modern_notify_with_data(
+    void *data,
+    u32 notification_data)
+{
+    struct virtio_pci_rust_vq *vq = data;
+	
+    iowrite32(notification_data, vq->notify);
+
+    return true;
+}
+
+static void vp_modern_enable_rust_vq(struct virtio_device *vdev,
+                                     unsigned int index)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+    struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+
+    vp_modern_set_queue_enable(mdev, index, true);
+}
+
+static irqreturn_t vp_rust_vq_interrupt(int irq, void *opaque)
+{
+	struct virtio_pci_rust_vq *vq = opaque;
+
+	if (!vq->interrupt)
+		return IRQ_NONE;
+
+	return vq->interrupt(vq->interrupt_data) ?
+		IRQ_HANDLED : IRQ_NONE;
+}
+
+static irqreturn_t vp_rust_interrupt(int irq, void *opaque)
+{
+	struct virtio_pci_rust_vqs *state = opaque;
+	struct virtio_pci_device *vp_dev = state->vp_dev;
+	unsigned int i;
+	u8 isr;
+
+	isr = ioread8(vp_dev->isr);
+
+	if (!isr)
+		return IRQ_NONE;
+
+	if (isr & VIRTIO_PCI_ISR_CONFIG)
+		virtio_config_changed(&vp_dev->vdev);
+
+	for (i = 0; i < state->nvqs; i++) {
+		struct virtio_pci_rust_vq *vq = &state->vqs[i];
+
+		if (vq->interrupt)
+			vq->interrupt(vq->interrupt_data);
+	}
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t vp_rust_shared_interrupt(int irq, void *opaque)
+{
+	struct virtio_pci_rust_vqs *state = opaque;
+	irqreturn_t ret = IRQ_NONE;
+	unsigned int i;
+
+	for (i = 0; i < state->nvqs; i++) {
+		struct virtio_pci_rust_vq *vq = &state->vqs[i];
+
+		if (!vq->interrupt)
+			continue;
+
+		if (vq->interrupt(vq->interrupt_data))
+			ret = IRQ_HANDLED;
+	}
+
+	return ret;
+}
+
+static int vp_modern_prepare_rust_vqs(
+	struct virtio_device *vdev,
+	unsigned int nvqs,
+	struct virtio_rust_vq_info *vqs)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+	unsigned int i;
+	unsigned int queue_idx = 0;
+	u16 size;
+
+	for (i = 0; i < nvqs; i++) {
+		if (!vqs[i].name)
+			continue;
+
+		if (queue_idx >= vp_modern_get_num_queues(mdev))
+			return -EINVAL;
+
+		size = vp_modern_get_queue_size(mdev, queue_idx);
+
+		if (!size ||
+		    vp_modern_get_queue_enable(mdev, queue_idx))
+			return -ENOENT;
+
+		vqs[i].index = queue_idx;
+		vqs[i].size = size;
+
+		queue_idx++;
+	}
+
+	return 0;
+}
+
+static irqreturn_t vp_rust_config_changed(int irq, void *opaque)
+{
+	struct virtio_pci_device *vp_dev = opaque;
+
+	virtio_config_changed(&vp_dev->vdev);
+
+	return IRQ_HANDLED;
+}
+
+static void vp_publish_rust_vqs(
+	struct virtio_device *vdev,
+	unsigned int nvqs,
+	struct virtio_rust_vq_info *vqs,
+	struct virtio_pci_rust_vqs *state)
+{
+	bool (*notify)(void *data, u32 notification_data);
+	unsigned int i;
+
+	if (__virtio_test_bit(vdev, VIRTIO_F_NOTIFICATION_DATA))
+		notify = vp_modern_notify_with_data;
+	else
+		notify = vp_modern_notify;
+
+	for (i = 0; i < nvqs; i++) {
+		if (!vqs[i].name)
+			continue;
+
+		vqs[i].notify = notify;
+		vqs[i].notify_data = &state->vqs[i];
+	}
+}
+
+static int vp_modern_setup_rust_vq(struct virtio_device *vdev,
+                                   u16 index, u16 queue_size,
+                                   u64 desc_addr, u64 avail_addr,
+                                   u64 used_addr, u16 msix_vec)
+{
+    struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+    struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+    u16 max_size;
+
+	if (index >= vp_modern_get_num_queues(mdev))
+		return -EINVAL;
+
+	max_size = vp_modern_get_queue_size(mdev, index);
+
+	if (!max_size || vp_modern_get_queue_enable(mdev, index))
+		return -ENOENT;
+
+	if (!queue_size || queue_size > max_size)
+		return -EINVAL;
+
+    vp_modern_set_queue_size(mdev, index, queue_size);
+    vp_modern_queue_address(mdev, index, desc_addr, avail_addr, used_addr);
+
+    if (msix_vec != VIRTIO_MSI_NO_VECTOR) {
+        msix_vec = vp_modern_queue_vector(mdev, index, msix_vec);
+        if (msix_vec == VIRTIO_MSI_NO_VECTOR)
+            return -EBUSY;
+    }
+
+    return 0;
+}
+
+static void vp_del_rust_vqs_state(
+	struct virtio_device *vdev,
+	struct virtio_pci_rust_vqs *state)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+	unsigned int i;
+
+	if (!state)
+		return;
+
+	/*
+	 * Dedicated per-VQ IRQs have their own dev_id.
+	 */
+	for (i = 0; i < state->nvqs; i++) {
+		struct virtio_pci_rust_vq *vq = &state->vqs[i];
+
+		if (vq->irq_requested) {
+			int irq =
+				pci_irq_vector(
+					vp_dev->pci_dev,
+					vq->msix_vector);
+
+			irq_update_affinity_hint(irq, NULL);
+			free_irq(irq, vq);
+
+			vq->irq_requested = false;
+		}
+
+		if (vq->configured &&
+		    vp_dev->msix_enabled &&
+		    vq->msix_vector != VIRTIO_MSI_NO_VECTOR) {
+			vp_modern_queue_vector(
+				mdev,
+				vq->index,
+				VIRTIO_MSI_NO_VECTOR);
+		}
+
+		if (vq->notify && !mdev->notify_base) {
+			pci_iounmap(
+				mdev->pci_dev,
+				vq->notify);
+
+			vq->notify = NULL;
+		}
+	}
+
+	/*
+	 * INTx, if this state came from the fallback path.
+	 */
+	if (state->intx_enabled) {
+		free_irq(vp_dev->pci_dev->irq, state);
+		state->intx_enabled = false;
+		vp_dev->intx_enabled = 0;
+	}
+
+	/*
+	 * MSI-X config/shared IRQs.
+	 *
+	 * Config vector uses vp_dev as dev_id.
+	 * Shared Rust VQ vector uses state as dev_id.
+	 */
+	if (vp_dev->msix_enabled) {
+		if (vp_dev->msix_used_vectors > 0)
+			free_irq(
+				pci_irq_vector(vp_dev->pci_dev, 0),
+				vp_dev);
+
+		if (!state->per_vq_vectors &&
+		    vp_dev->msix_used_vectors > 1)
+			free_irq(
+				pci_irq_vector(vp_dev->pci_dev, 1),
+				state);
+
+		vp_dev->config_vector(
+			vp_dev,
+			VIRTIO_MSI_NO_VECTOR);
+
+		pci_free_irq_vectors(vp_dev->pci_dev);
+
+		vp_dev->msix_enabled = 0;
+	}
+
+	if (vp_dev->msix_affinity_masks) {
+		for (i = 0; i < vp_dev->msix_vectors; i++)
+			free_cpumask_var(
+				vp_dev->msix_affinity_masks[i]);
+	}
+
+	vp_dev->msix_vectors = 0;
+	vp_dev->msix_used_vectors = 0;
+	vp_dev->per_vq_vectors = false;
+
+	kfree(vp_dev->msix_names);
+	vp_dev->msix_names = NULL;
+
+	kfree(vp_dev->msix_affinity_masks);
+	vp_dev->msix_affinity_masks = NULL;
+
+	kfree(state);
+}
+
+
+static int vp_find_rust_vqs_intx(
+	struct virtio_device *vdev,
+	unsigned int nvqs,
+	struct virtio_rust_vq_info *vqs,
+	struct virtio_pci_rust_vqs **out)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+	struct virtio_pci_rust_vqs *state;
+	unsigned int i;
+	int err;
+
+	state = kzalloc(struct_size(state, vqs, nvqs), GFP_KERNEL);
+	if (!state)
+		return -ENOMEM;
+
+	state->vp_dev = vp_dev;
+	state->nvqs = nvqs;
+
+	err = request_irq(vp_dev->pci_dev->irq,
+			  vp_rust_interrupt,
+			  IRQF_SHARED,
+			  dev_name(&vdev->dev),
+			  state);
+	if (err)
+		goto err_state;
+
+	/*
+	 * Keep the existing transport-global state coherent.
+	 * vp_synchronize_vectors() uses this flag.
+	 */
+	vp_dev->intx_enabled = 1;
+	state->intx_enabled = true;
+	vp_dev->per_vq_vectors = false;
+
+	for (i = 0; i < nvqs; i++) {
+		struct virtio_rust_vq_info *src = &vqs[i];
+		struct virtio_pci_rust_vq *dst = &state->vqs[i];
+
+		if (!src->name)
+			continue;
+
+		dst->index = src->index;
+		dst->interrupt = src->interrupt;
+		dst->interrupt_data = src->interrupt_data;
+
+		err = vp_modern_setup_rust_vq(
+			vdev,
+			src->index,
+			src->size,
+			src->desc_addr,
+			src->avail_addr,
+			src->used_addr,
+			VIRTIO_MSI_NO_VECTOR);
+		if (err)
+			goto err_cleanup;
+
+		dst->notify =
+			vp_modern_map_vq_notify(mdev, src->index, NULL);
+
+		if (!dst->notify) {
+			err = -ENOMEM;
+			goto err_cleanup;
+		}
+	}
+
+	/*
+	 * Same rule as the existing modern path:
+	 * enabling must be the final operation.
+	 */
+	for (i = 0; i < nvqs; i++) {
+		if (!vqs[i].name)
+			continue;
+
+		vp_modern_enable_rust_vq(vdev, vqs[i].index);
+	}
+
+	*out = state;
+	return 0;
+
+err_cleanup:
+	for (i = 0; i < nvqs; i++) {
+		if (state->vqs[i].notify && !mdev->notify_base)
+			pci_iounmap(mdev->pci_dev,
+				   state->vqs[i].notify);
+	}
+
+	free_irq(vp_dev->pci_dev->irq, state);
+	vp_dev->intx_enabled = 0;
+
+err_state:
+	kfree(state);
+	return err;
+}
+
+static int vp_request_rust_msix_vectors(
+	struct virtio_device *vdev,
+	int nvectors,
+	bool per_vq_vectors,
+	struct irq_affinity *desc,
+	struct virtio_pci_rust_vqs *state)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+	const char *name = dev_name(&vp_dev->vdev.dev);
+	unsigned int flags = PCI_IRQ_MSIX;
+	unsigned int i, v;
+	int err = -ENOMEM;
+
+	vp_dev->msix_vectors = nvectors;
+
+	vp_dev->msix_names =
+		kmalloc_array(nvectors,
+			      sizeof(*vp_dev->msix_names),
+			      GFP_KERNEL);
+	if (!vp_dev->msix_names)
+		goto error;
+
+	vp_dev->msix_affinity_masks =
+		kcalloc(nvectors,
+			sizeof(*vp_dev->msix_affinity_masks),
+			GFP_KERNEL);
+	if (!vp_dev->msix_affinity_masks)
+		goto error;
+
+	for (i = 0; i < nvectors; ++i)
+		if (!alloc_cpumask_var(
+			    &vp_dev->msix_affinity_masks[i],
+			    GFP_KERNEL))
+			goto error;
+
+	if (!per_vq_vectors)
+		desc = NULL;
+
+	if (desc) {
+		flags |= PCI_IRQ_AFFINITY;
+		desc->pre_vectors++;
+	}
+
+	err = pci_alloc_irq_vectors_affinity(
+		vp_dev->pci_dev,
+		nvectors,
+		nvectors,
+		flags,
+		desc);
+	if (err < 0)
+		goto error;
+
+	vp_dev->msix_enabled = 1;
+
+	/* Configuration vector. */
+	v = vp_dev->msix_used_vectors;
+
+	snprintf(vp_dev->msix_names[v],
+		 sizeof(*vp_dev->msix_names),
+		 "%s-config", name);
+
+	err = request_irq(
+		pci_irq_vector(vp_dev->pci_dev, v),
+		vp_rust_config_changed,
+		0,
+		vp_dev->msix_names[v],
+		vp_dev);
+	if (err)
+		goto error;
+
+	++vp_dev->msix_used_vectors;
+
+	v = vp_dev->config_vector(vp_dev, v);
+	if (v == VIRTIO_MSI_NO_VECTOR) {
+		err = -EBUSY;
+		goto error;
+	}
+
+	if (!per_vq_vectors) {
+		/* One shared MSI-X vector for all Rust queues. */
+		v = vp_dev->msix_used_vectors;
+
+		snprintf(vp_dev->msix_names[v],
+			 sizeof(*vp_dev->msix_names),
+			 "%s-virtqueues", name);
+
+		err = request_irq(
+			pci_irq_vector(vp_dev->pci_dev, v),
+			vp_rust_shared_interrupt,
+			0,
+			vp_dev->msix_names[v],
+			state);
+		if (err)
+			goto error;
+
+		++vp_dev->msix_used_vectors;
+	}
+
+	return 0;
+
+error:
+	return err;
+}
+
+static int vp_find_one_rust_vq_msix(
+	struct virtio_device *vdev,
+	struct virtio_rust_vq_info *src,
+	struct virtio_pci_rust_vq *dst,
+	int *allocated_vectors,
+	bool per_vq_vectors)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+	u16 msix_vec;
+	int err;
+
+	if (!src->interrupt)
+		msix_vec = VIRTIO_MSI_NO_VECTOR;
+	else if (per_vq_vectors)
+		msix_vec = (*allocated_vectors)++;
+	else
+		msix_vec = VP_MSIX_VQ_VECTOR;
+
+	dst->index = src->index;
+	dst->interrupt = src->interrupt;
+	dst->interrupt_data = src->interrupt_data;
+	dst->msix_vector = msix_vec;
+
+	err = vp_modern_setup_rust_vq(
+		vdev,
+		src->index,
+		src->size,
+		src->desc_addr,
+		src->avail_addr,
+		src->used_addr,
+		msix_vec);
+	if (err)
+		return err;
+
+	dst->configured = true;
+
+	dst->notify =
+		vp_modern_map_vq_notify(mdev, src->index, NULL);
+	if (!dst->notify)
+		return -ENOMEM;
+
+	if (!per_vq_vectors ||
+	    msix_vec == VIRTIO_MSI_NO_VECTOR)
+		return 0;
+
+	snprintf(vp_dev->msix_names[msix_vec],
+		 sizeof(*vp_dev->msix_names),
+		 "%s-%s",
+		 dev_name(&vp_dev->vdev.dev),
+		 src->name);
+
+	err = request_irq(
+		pci_irq_vector(vp_dev->pci_dev, msix_vec),
+		vp_rust_vq_interrupt,
+		0,
+		vp_dev->msix_names[msix_vec],
+		dst);
+	if (err)
+		return err;
+
+	dst->irq_requested = true;
+
+	return 0;
+}
+
+static int vp_find_rust_vqs_msix(
+	struct virtio_device *vdev,
+	unsigned int nvqs,
+	struct virtio_rust_vq_info *vqs,
+	bool per_vq_vectors,
+	struct irq_affinity *desc,
+	struct virtio_pci_rust_vqs **out)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+	struct virtio_pci_rust_vqs *state;
+	int allocated_vectors;
+	int nvectors;
+	unsigned int i;
+	int err;
+
+	state = kzalloc(
+		struct_size(state, vqs, nvqs),
+		GFP_KERNEL);
+	if (!state)
+		return -ENOMEM;
+
+	state->vp_dev = vp_dev;
+	state->nvqs = nvqs;
+	state->per_vq_vectors = per_vq_vectors;
+
+	if (per_vq_vectors) {
+		/*
+		 * One config vector plus one vector for every queue
+		 * having a callback.
+		 */
+		nvectors = 1;
+
+		for (i = 0; i < nvqs; i++) {
+			if (vqs[i].name && vqs[i].interrupt)
+				nvectors++;
+		}
+	} else {
+		/*
+		 * One config vector + one shared VQ vector.
+		 */
+		nvectors = 2;
+	}
+
+	err = vp_request_rust_msix_vectors(
+		vdev,
+		nvectors,
+		per_vq_vectors,
+		desc,
+		state);
+	if (err)
+		goto error;
+
+	vp_dev->per_vq_vectors = per_vq_vectors;
+
+	allocated_vectors = vp_dev->msix_used_vectors;
+
+	for (i = 0; i < nvqs; i++) {
+		if (!vqs[i].name)
+			continue;
+
+		err = vp_find_one_rust_vq_msix(
+			vdev,
+			&vqs[i],
+			&state->vqs[i],
+			&allocated_vectors,
+			per_vq_vectors);
+		if (err)
+			goto error;
+	}
+
+	/*
+	 * Has to be done last.
+	 */
+	for (i = 0; i < nvqs; i++) {
+		if (!vqs[i].name)
+			continue;
+
+		vp_modern_enable_rust_vq(vdev, vqs[i].index);
+	}
+
+	*out = state;
+	return 0;
+
+error:
+	/* helper che implementiamo subito sotto */
+	vp_del_rust_vqs_state(vdev, state);
+	return err;
+}
+
+static void vp_modern_del_rust_vqs(
+    struct virtio_device *vdev,
+    void *transport_data)
+{
+    vp_del_rust_vqs_state(vdev, transport_data);
+}
+
+
+static int vp_modern_setup_rust_vqs(
+	struct virtio_device *vdev,
+	unsigned int nvqs,
+	struct virtio_rust_vq_info *vqs,
+	struct irq_affinity *desc,
+	void **transport_data)
+{
+	struct virtio_pci_rust_vqs *state;
+	unsigned int i;
+	int err;
+
+	/*
+	 * Outputs are published only after one complete setup attempt
+	 * has succeeded.
+	 */
+	*transport_data = NULL;
+
+	for (i = 0; i < nvqs; i++) {
+		vqs[i].notify = NULL;
+		vqs[i].notify_data = NULL;
+	}
+
+	/* Best case: one MSI-X vector per queue. */
+	err = vp_find_rust_vqs_msix(
+		vdev,
+		nvqs,
+		vqs,
+		true,
+		desc,
+		&state);
+	if (!err)
+		goto success;
+
+	/*
+	 * Without admin/slow-path queues our SHARED_SLOW policy is
+	 * equivalent to EACH, so we skip it for now.
+	 */
+
+	/* Fallback: one MSI-X vector shared by all queues. */
+	err = vp_find_rust_vqs_msix(
+		vdev,
+		nvqs,
+		vqs,
+		false,
+		desc,
+		&state);
+	if (!err)
+		goto success;
+
+	if (!to_vp_device(vdev)->pci_dev->irq)
+		return err;
+
+	/* Final fallback: INTx. */
+	err = vp_find_rust_vqs_intx(
+		vdev,
+		nvqs,
+		vqs,
+		&state);
+	if (err)
+		return err;
+
+success:
+	vp_publish_rust_vqs(
+		vdev,
+		nvqs,
+		vqs,
+		state);
+
+	*transport_data = state;
+
+	return 0;
+}
+
 static const struct virtio_config_ops virtio_pci_config_nodev_ops = {
 	.get		= NULL,
 	.set		= NULL,
@@ -1233,6 +1955,9 @@ static const struct virtio_config_ops virtio_pci_config_nodev_ops = {
 	.reset		= vp_reset,
 	.find_vqs	= vp_modern_find_vqs,
 	.del_vqs	= vp_del_vqs,
+	.prepare_rust_vqs = vp_modern_prepare_rust_vqs,
+	.setup_rust_vqs   = vp_modern_setup_rust_vqs,
+	.del_rust_vqs     = vp_modern_del_rust_vqs,
 	.synchronize_cbs = vp_synchronize_vectors,
 	.get_extended_features = vp_get_features,
 	.finalize_features = vp_finalize_features,
@@ -1253,6 +1978,9 @@ static const struct virtio_config_ops virtio_pci_config_ops = {
 	.reset		= vp_reset,
 	.find_vqs	= vp_modern_find_vqs,
 	.del_vqs	= vp_del_vqs,
+	.prepare_rust_vqs = vp_modern_prepare_rust_vqs,
+	.setup_rust_vqs   = vp_modern_setup_rust_vqs,
+	.del_rust_vqs     = vp_modern_del_rust_vqs,
 	.synchronize_cbs = vp_synchronize_vectors,
 	.get_extended_features = vp_get_features,
 	.finalize_features = vp_finalize_features,

@@ -32,6 +32,51 @@ struct virtqueue_info {
 	bool ctx;
 };
 
+
+struct virtio_rust_vq_info {
+	const char *name;
+
+	/* Filled by prepare_rust_vqs(). */
+	unsigned int index;
+	u16 size;
+
+	/* Filled by Rust after VirtQueue::new(). */
+	dma_addr_t desc_addr;
+	dma_addr_t avail_addr;
+	dma_addr_t used_addr;
+
+	/* Rust interrupt dispatcher. */
+	bool (*interrupt)(void *data);
+	void *interrupt_data;
+
+	/* Rust notify dispatcher. */
+	bool (*notify)(void *data, u32 notification_data);
+	void *notify_data;
+};
+
+struct virtio_pci_rust_vq {
+	unsigned int index;
+	u16 msix_vector;
+
+	bool (*interrupt)(void *data);
+	void *interrupt_data;
+
+	void __iomem *notify;
+
+	bool configured;
+	bool irq_requested;
+};
+
+struct virtio_pci_rust_vqs {
+	struct virtio_pci_device *vp_dev;
+
+	unsigned int nvqs;
+	bool per_vq_vectors;
+	bool intx_enabled;
+
+	struct virtio_pci_rust_vq vqs[];
+};
+
 /**
  * struct virtio_config_ops - operations for configuring a virtio device
  * Note: Do not assume that a transport implements all of the operations
@@ -123,6 +168,16 @@ struct virtio_config_ops {
 			struct virtqueue_info vqs_info[],
 			struct irq_affinity *desc);
 	void (*del_vqs)(struct virtio_device *);
+	int (*prepare_rust_vqs)(struct virtio_device *vdev,
+			unsigned int nvqs,
+			struct virtio_rust_vq_info *vqs);
+    int (*setup_rust_vqs)(struct virtio_device *vdev,
+			unsigned int nvqs,
+			struct virtio_rust_vq_info *vqs,
+			struct irq_affinity *desc,
+			void **transport_data);
+	void (*del_rust_vqs)(struct virtio_device *vdev,
+			void *transport_data);
 	void (*synchronize_cbs)(struct virtio_device *);
 	u64 (*get_features)(struct virtio_device *vdev);
 	void (*get_extended_features)(struct virtio_device *vdev,
