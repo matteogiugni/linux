@@ -7,6 +7,25 @@
 //!
 //! [`LKMM`]: srctree/tools/memory-model/
 
+/// Ordering requested from a memory barrier.
+#[derive(Copy, Clone)]
+pub enum BarrierKind {
+    /// Orders preceding loads before succeeding loads.
+    Read,
+
+    /// Orders preceding stores before succeeding stores.
+    Write,
+
+    /// Orders all preceding memory accesses before all succeeding accesses.
+    Full,
+}
+
+pub use BarrierKind::{
+    Full,
+    Read,
+    Write,
+};
+
 /// A compiler barrier.
 ///
 /// A barrier that prevents compiler from reordering memory accesses across the barrier.
@@ -17,6 +36,46 @@ pub(crate) fn barrier() {
     //
     // SAFETY: An empty asm block.
     unsafe { core::arch::asm!("") };
+}
+
+/// Memory barrier.
+///
+/// This orders memory accesses according to `kind`.
+///
+/// - `mb(Read)` is equivalent to C `rmb()`.
+/// - `mb(Write)` is equivalent to C `wmb()`.
+/// - `mb(Full)` is equivalent to C `mb()`.
+#[inline]
+pub fn mb(kind: BarrierKind) {
+    // SAFETY:
+    // Memory barrier helpers are safe to invoke.
+    unsafe {
+        match kind {
+            Read => bindings::rmb(),
+            Write => bindings::wmb(),
+            Full => bindings::mb(),
+        }
+    }
+}
+
+/// DMA memory barrier.
+///
+/// This orders accesses between the local CPU and bus-mastering devices.
+///
+/// - `dma_mb(Read)` is equivalent to C `dma_rmb()`.
+/// - `dma_mb(Write)` is equivalent to C `dma_wmb()`.
+/// - `dma_mb(Full)` is equivalent to C `dma_mb()`.
+#[inline]
+pub fn dma_mb(kind: BarrierKind) {
+    // SAFETY:
+    // DMA memory barrier helpers are safe to invoke.
+    unsafe {
+        match kind {
+            Read => bindings::dma_rmb(),
+            Write => bindings::dma_wmb(),
+            Full => bindings::dma_mb(),
+        }
+    }
 }
 
 /// A full memory barrier.
