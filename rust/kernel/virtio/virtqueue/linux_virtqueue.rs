@@ -33,23 +33,6 @@ use super::hal::{
     MemoryRegion,
 };
 
-/*pub struct LinuxDeviceReset {
-    vdev: NonNull<bindings::virtio_device>,
-}
-
-unsafe impl DeviceReset for LinuxDeviceReset {
-    fn reset(&self) {
-        // SAFETY:
-        // `vdev` points to the VirtIO device owning these virtqueues
-        // and remains valid for the lifetime of `LinuxDeviceReset`.
-        unsafe {
-            bindings::virtio_reset_device(
-                self.vdev.as_ptr(),
-            );
-        }
-    }
-}*/
-
 pub(crate) struct LinuxHal {
     device: ARef<device::Device>,
 }
@@ -98,6 +81,10 @@ unsafe impl VirtQueueAllocator for LinuxHal {
         })
     }
 
+    /// SAFETY:
+    ///
+    /// `ptr`, `size`, and `align` must describe an allocation
+    /// obtained from `Self::alloc`.
     unsafe fn dealloc(
         ptr: NonNull<u8>,
         size: usize,
@@ -190,6 +177,10 @@ unsafe impl VirtQueueAllocator for LinuxHal {
         })
     }
 
+    /// SAFETY:
+    ///
+    /// `region` must have been returned by a previous call to `dma_alloc`
+    /// and must not be used after this call, device included.
     unsafe fn dma_free(
         &self,
         region: DmaRegion,
@@ -228,44 +219,3 @@ unsafe impl Hal for LinuxHal {
         barrier::mb(Full);
     }
 }
-
-/*
-fn setup_rust_queue(
-    dev: *mut bindings::virtio_device,
-    index: u16,
-    queue: &SplitQueue<LinuxHal>,
-    msix_vec: u16,
-) -> Result<NotifyAddr> {
-    to_result(unsafe {
-        bindings::vp_modern_setup_rust_vq(
-            mdev,
-            index,
-            queue.size(),
-            queue.desc_paddr(),
-            queue.avail_paddr(),
-            queue.used_paddr(),
-            msix_vec,
-        )
-    })?;
-
-    unsafe { bindings::vp_modern_enable_rust_vq(mdev, index) };
-
-    let notify = unsafe {
-        bindings::vp_modern_map_vq_notify(mdev, index, core::ptr::null_mut())
-    };
-    if notify.is_null() {
-        return Err(ENOMEM);
-    }
-
-    Ok(NotifyAddr(notify))
-}
-
-pub struct NotifyAddr(*mut core::ffi::c_void);
-
-impl NotifyAddr {
-    pub fn notify(&self, queue_index: u16) {
-        // SAFETY: self.0 è un indirizzo MMIO valido
-        unsafe { bindings::iowrite16(queue_index, self.0 as *mut _) };
-    }
-}
-*/

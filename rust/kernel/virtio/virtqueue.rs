@@ -1341,7 +1341,7 @@ impl<H: Hal> VirtQueue<H> {
     }
 
     
-    //TODO DELETE FROM HERE ON
+    //TODO DELETE FROM HERE ON AFTER THE TESTS
     /// Debug functions to inspect the virtqueue state.
     #[inline]
     pub(crate) fn debug_avail_event(&self) -> u16 {
@@ -1865,6 +1865,16 @@ pub struct VirtQueueFeatures {
     pub indirect: bool,
 }
 
+
+/*** 
+*
+*
+* Possible refactoring of the virtqueue drop logic handling and its safe wrapper
+*
+*
+***/
+
+/*
 /// A Trait that must be implemented by a wrapper of the VirtQueue struct to
 /// safely implement the drop of the VirtQueue and guarantee that the device 
 /// has been reset and can no longer access the virtqueue or any outstanding descriptor chain
@@ -1875,7 +1885,6 @@ pub unsafe trait DeviceReset {
     fn reset(&self);
 }
 
-/*
 pub struct VirtQueues<H, D>
 where
     H: Hal,

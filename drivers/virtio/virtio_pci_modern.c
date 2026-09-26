@@ -1419,9 +1419,6 @@ static void vp_del_rust_vqs_state(
 	if (!state)
 		return;
 
-	/*
-	 * Dedicated per-VQ IRQs have their own dev_id.
-	 */
 	for (i = 0; i < state->nvqs; i++) {
 		struct virtio_pci_rust_vq *vq = &state->vqs[i];
 
@@ -1455,21 +1452,12 @@ static void vp_del_rust_vqs_state(
 		}
 	}
 
-	/*
-	 * INTx, if this state came from the fallback path.
-	 */
 	if (state->intx_enabled) {
 		free_irq(vp_dev->pci_dev->irq, state);
 		state->intx_enabled = false;
 		vp_dev->intx_enabled = 0;
 	}
 
-	/*
-	 * MSI-X config/shared IRQs.
-	 *
-	 * Config vector uses vp_dev as dev_id.
-	 * Shared Rust VQ vector uses state as dev_id.
-	 */
 	if (vp_dev->msix_enabled) {
 		if (vp_dev->msix_used_vectors > 0)
 			free_irq(
@@ -1538,10 +1526,6 @@ static int vp_find_rust_vqs_intx(
 	if (err)
 		goto err_state;
 
-	/*
-	 * Keep the existing transport-global state coherent.
-	 * vp_synchronize_vectors() uses this flag.
-	 */
 	vp_dev->intx_enabled = 1;
 	state->intx_enabled = true;
 	vp_dev->per_vq_vectors = false;
@@ -1577,10 +1561,6 @@ static int vp_find_rust_vqs_intx(
 		}
 	}
 
-	/*
-	 * Same rule as the existing modern path:
-	 * enabling must be the final operation.
-	 */
 	for (i = 0; i < nvqs; i++) {
 		if (!vqs[i].name)
 			continue;
@@ -1660,7 +1640,6 @@ static int vp_request_rust_msix_vectors(
 
 	vp_dev->msix_enabled = 1;
 
-	/* Configuration vector. */
 	v = vp_dev->msix_used_vectors;
 
 	snprintf(vp_dev->msix_names[v],
@@ -1685,7 +1664,6 @@ static int vp_request_rust_msix_vectors(
 	}
 
 	if (!per_vq_vectors) {
-		/* One shared MSI-X vector for all Rust queues. */
 		v = vp_dev->msix_used_vectors;
 
 		snprintf(vp_dev->msix_names[v],
@@ -1802,10 +1780,6 @@ static int vp_find_rust_vqs_msix(
 	state->per_vq_vectors = per_vq_vectors;
 
 	if (per_vq_vectors) {
-		/*
-		 * One config vector plus one vector for every queue
-		 * having a callback.
-		 */
 		nvectors = 1;
 
 		for (i = 0; i < nvqs; i++) {
@@ -1813,9 +1787,6 @@ static int vp_find_rust_vqs_msix(
 				nvectors++;
 		}
 	} else {
-		/*
-		 * One config vector + one shared VQ vector.
-		 */
 		nvectors = 2;
 	}
 
@@ -1846,9 +1817,6 @@ static int vp_find_rust_vqs_msix(
 			goto error;
 	}
 
-	/*
-	 * Has to be done last.
-	 */
 	for (i = 0; i < nvqs; i++) {
 		if (!vqs[i].name)
 			continue;
@@ -1860,7 +1828,6 @@ static int vp_find_rust_vqs_msix(
 	return 0;
 
 error:
-	/* helper che implementiamo subito sotto */
 	vp_del_rust_vqs_state(vdev, state);
 	return err;
 }
@@ -1884,10 +1851,6 @@ static int vp_modern_setup_rust_vqs(
 	unsigned int i;
 	int err;
 
-	/*
-	 * Outputs are published only after one complete setup attempt
-	 * has succeeded.
-	 */
 	*transport_data = NULL;
 
 	for (i = 0; i < nvqs; i++) {
@@ -1895,7 +1858,6 @@ static int vp_modern_setup_rust_vqs(
 		vqs[i].notify_data = NULL;
 	}
 
-	/* Best case: one MSI-X vector per queue. */
 	err = vp_find_rust_vqs_msix(
 		vdev,
 		nvqs,
@@ -1906,12 +1868,6 @@ static int vp_modern_setup_rust_vqs(
 	if (!err)
 		goto success;
 
-	/*
-	 * Without admin/slow-path queues our SHARED_SLOW policy is
-	 * equivalent to EACH, so we skip it for now.
-	 */
-
-	/* Fallback: one MSI-X vector shared by all queues. */
 	err = vp_find_rust_vqs_msix(
 		vdev,
 		nvqs,
@@ -1925,7 +1881,6 @@ static int vp_modern_setup_rust_vqs(
 	if (!to_vp_device(vdev)->pci_dev->irq)
 		return err;
 
-	/* Final fallback: INTx. */
 	err = vp_find_rust_vqs_intx(
 		vdev,
 		nvqs,

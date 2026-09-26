@@ -197,7 +197,7 @@ unsafe impl<Ctx: crate::device::DeviceContext> crate::device::AsBusDevice<Ctx> f
 kernel::impl_device_context_deref!(unsafe { Device });
 
 /*
-TODO 
+TODO OPTIMIZATION
 kernel::impl_device_context_into_aref!(Device);
 
 unsafe impl crate::sync::aref::AlwaysRefCounted for Device {
@@ -267,20 +267,6 @@ impl<Ctx: crate::device::DeviceContext> Device<Ctx> {
         unsafe { bindings::virtio_device_ready(self.as_raw()) }
     }
 
-    /*
-    /// Delete virtqueues from this device.
-    pub(crate) fn del_vqs(&self) {
-        // SAFETY: By its type invariant `self.as_raw` is always a valid pointer to a
-        // `struct virtio_device`.
-        let config = unsafe { (*self.as_raw()).config };
-        // SAFETY: `config` points to a valid virtqueue config struct.
-        if let Some(del_vqs) = unsafe { (*config).del_vqs } {
-            // SAFETY: By its type invariant `self.as_raw` is always a valid pointer to a
-            // `struct virtio_device`.
-            unsafe { del_vqs(self.as_raw()) }
-        }
-    }*/
-
     /// Checks if the device has a feature bit.
     #[inline]
     pub fn has_feature(&self, fbit: c_uint) -> bool {
@@ -324,10 +310,13 @@ impl Device<crate::device::Core> {
             &*(*self.as_raw()).config
         };
 
+
+        // CALL 1: what happens before creating the virtqueues.
         let prepare = config
             .prepare_rust_vqs
             .ok_or(ENOTSUPP)?;
 
+        // CALL 2: what happens after creating the virtqueues.
         let setup = config
             .setup_rust_vqs
             .ok_or(ENOTSUPP)?;
@@ -346,6 +335,7 @@ impl Device<crate::device::Core> {
             KVec::with_capacity(info.len(), GFP_KERNEL)?;
 
         for vqi in info {
+            //TODO context support
             // Context support is not implemented by the Rust virtqueue yet.
             if vqi.ctx {
                 return Err(ENOTSUPP);
@@ -368,7 +358,7 @@ impl Device<crate::device::Core> {
                     interrupt: None,
                     interrupt_data: core::ptr::null_mut(),
 
-                    // Filled ?.
+                    // Defined by setup_rust_vqs().
                     notify: None,
                     notify_data: core::ptr::null_mut(),
                 },
@@ -496,7 +486,7 @@ impl Device<crate::device::Core> {
                 self.as_raw(),
                 configs.len().try_into()?,
                 configs.as_mut_ptr(),
-                core::ptr::null_mut(), // irq_affinity unsupported for now
+                core::ptr::null_mut(), //TODO irq_affinity unsupported for now
                 &mut transport_data,
             )
         })?;
@@ -508,17 +498,13 @@ impl Device<crate::device::Core> {
         * mappings. Publish the non-owning notify handles into the Rust
         * wrappers.
         *
-        * Nothing in this loop may fail.
+        * Nothing fallible should happen after this point.
         */
         for i in 0..inner.len() {
             inner[i].notify = configs[i].notify;
             inner[i].notify_data = configs[i].notify_data;
         }
 
-        /*
-        * IMPORTANT:
-        * Nothing fallible after setup_rust_vqs() succeeds.
-        */
         Ok(Virtqueues {
             inner,
             transport_data,
@@ -800,7 +786,7 @@ impl VirtQueue {
 
         self.notify_with_data(notification_data)
         */
-        // TODO DELETE FROM HERE ON
+        //TODO DELETE FROM HERE ON AFTER THE TESTS and uncomment above
         let (
             avail_idx,
             avail_event,
@@ -847,6 +833,7 @@ impl VirtQueue {
         self.notify_with_data(notification_data)
     }
 
+    //TODO we may want the driver to pass any address and then DMA map it here
     /// Adds one device-writable DMA buffer.
     ///
     /// # Safety
@@ -899,7 +886,7 @@ pub struct Virtqueues {
     // Keeps the underlying device alive until all queues have been destroyed.
     _device: ARef<crate::device::Device>,
 
-    //TODO make virtio device ARef counted
+    //TODO OPTIMIZATION make virtio device ARef counted
     // device: ARef<Device>,
 }
 
@@ -945,7 +932,7 @@ impl Drop for Virtqueues {
         let vdev = self.vdev.as_ptr();
 
         pr_info!("virtio: Virtqueues::drop: reset begin\n");
-        //TODO decide if remove_callback should call the reset
+        
         // Stop device DMA/interrupt generation first.
         unsafe {
             bindings::virtio_reset_device(vdev);
